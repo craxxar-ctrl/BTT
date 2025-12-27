@@ -1,0 +1,10 @@
+﻿const modifier = (text) => { 
+  text = onContext_BTT(text);
+
+
+  return { text }
+}//end of modifier
+
+
+// Don't modify this part
+modifier(text)

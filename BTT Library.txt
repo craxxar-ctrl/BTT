@@ -1,0 +1,946 @@
+﻿/* ============================================================================
+   BODY TRANSFORMATION TRACKER (BTT) — FULL LIBRARY (CLEAN / WHOLE)
+
+
+   Fix in THIS version:
+   - Gender initialization no longer misfires on stray "futa" mentions.
+   - Gender is detected ONLY from player-description context using anchors:
+       "you", "your", "player", "character", "i am", "i'm"
+     It prefers the gender keyword closest to those anchors.
+   - Commands (/btt...) are stripped before gender detection.
+
+
+   Everything else preserved:
+   - Slots: head, hair, arms, legs, breasts, nipples, gut, penis, vagina, ass, tail, wings
+   - "ass" includes anus + cheeks region terms
+   - Femininity: -100..+100
+   - Fertility/Virility independent
+   - Trait stacking & detection
+   - Manual commands: /btthelp /bttadd /bttfem /bttfert /bttvir
+============================================================================ */
+
+
+/* ---------------------------- CONFIG: SLOTS ---------------------------- */
+
+
+var BTT_SLOTS = [
+  "head","hair","arms","legs",
+  "breasts","nipples","gut",
+  "penis","vagina",
+  "ass",
+  "tail","wings"
+];
+
+
+/* ------------------------- SLOT TRIGGERS ------------------------------- */
+
+
+var BTT_SLOT_TRIGGERS = {
+  head:    ["head","face","skull","jaw","eyes","mouth"],
+  hair:    ["hair","locks","mane"],
+  arms:    ["arm","arms","hand","hands","finger","fingers"],
+  legs:    ["leg","legs","thigh","thighs","calf","calves","foot","feet"],
+  breasts: ["breast","breasts","boobs","chest"],
+  nipples: ["nipple","nipples","areola","areolae"],
+  gut:     ["waist","belly","stomach","abdomen","gut"],
+  penis:   ["penis","cock","dick","shaft","member","phallus"],
+  vagina:  ["vagina","pussy","cunt","slit","sex"],
+  ass:     ["ass","butt","cheek","cheeks","anus","asshole","rear","hole","sphincter"],
+  tail:    ["tail"],
+  wings:   ["wing","wings"]
+};
+
+
+/* -------------------------- TRAIT AXES -------------------------------- */
+
+
+var BTT_TRAITS = {
+  creature: [
+    "human",
+    "demonic","succubus","incubus","angelic","eldritch",
+    "draconic","dragon",
+    "reptilian","naga",
+    "feline","cat",
+    "canine","dog","wolf",
+    "vulpine","fox",
+    "bovine","equine","avian",
+    "slime","ooze",
+    "plant","fungal",
+    "insectoid","arachnid",
+    "furry","scaly","chitinous"
+  ],
+
+
+  material: [
+    "flesh",
+    "rubber","latex",
+    "slime","gel","gelatinous",
+    "crystal","glass","obsidian",
+    "stone","metal",
+    "wax","plastic",
+    "silicone","leather",
+    "fur","scales","chitin"
+  ],
+
+
+  texture: [
+    "smooth","slick","sticky",
+    "velvet","fuzzy","hairy",
+    "scaled","ridged",
+    "ribbed","knotted","barbed","spined",
+    "porous","glossy","oily","wet","dry"
+  ],
+
+
+  sexual_function: [
+    "fertile","virile",
+    "lactating","milk-producing",
+    "leaking","self-lubricating",
+    "heat-cycling","estrus",
+    "rutting",
+    "cum-producing"
+  ],
+
+
+  morphology: [
+    "prehensile",
+    "split","bifurcated",
+    "multi-chambered",
+    "inflatable",
+    "telescoping",
+    "segmented",
+    "tentacled",
+    "coiled",
+    "double","multiple",
+    "barbed","ribbed","knotted","ringed","spaded",
+    "extra-clit","extra-erogenous-zone"
+  ],
+
+
+  sensory: [
+    "oversensitive","hypersensitive",
+    "numb",
+    "responsive",
+    "erogenous","extra-erogenous",
+    "tingly","throbbing"
+  ],
+
+
+  presentation: [
+    "feminine","masculine","androgynous",
+    "cute","monstrous",
+    "sleek","bulky","dainty","imposing"
+  ],
+
+
+  sex_keywords: [
+    "cock","pussy","penile","vaginal"
+  ]
+};
+
+
+/* ---------------------- INTERNAL: FLATTEN TRAITS ------------------------ */
+
+
+var BTT_ALL_TRAITS = (function(){
+  var out = [];
+  var seen = {};
+  for(var axis in BTT_TRAITS){
+    if(!BTT_TRAITS.hasOwnProperty(axis)) continue;
+    for(var i=0;i<BTT_TRAITS[axis].length;i++){
+      var t = String(BTT_TRAITS[axis][i]).toLowerCase();
+      if(seen[t]) continue;
+      seen[t] = true;
+      out.push(t);
+    }
+  }
+  return out;
+})();
+
+
+/* ----------------------------- HELPERS ---------------------------------- */
+
+
+function BTT_clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+
+
+function BTT_escapeRegex(s){
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+
+function BTT_wordMatch(text, word){
+  var w = BTT_escapeRegex(String(word || "").toLowerCase());
+  if(!w) return false;
+  return new RegExp("\\b" + w + "\\b", "i").test(text);
+}
+
+
+function BTT_findAllWordPositions(textLower, wordLower){
+  var w = BTT_escapeRegex(wordLower);
+  var re = new RegExp("\\b" + w + "\\b", "gi");
+  var m, out = [];
+  while((m = re.exec(textLower)) !== null){
+    out.push(m.index);
+  }
+  return out;
+}
+
+
+function BTT_splitClauses(text){
+  return String(text || "")
+    .split(/[.,;:!?]/g)
+    .map(function(s){ return s.trim(); })
+    .filter(function(s){ return s.length > 0; });
+}
+
+
+function BTT_lastSlotInClause(clauseLower){
+  var bestSlot = null;
+  var bestPos = -1;
+
+
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    var triggers = BTT_SLOT_TRIGGERS[slot] || [];
+    for(var t=0;t<triggers.length;t++){
+      var trig = String(triggers[t]).toLowerCase();
+      var positions = BTT_findAllWordPositions(clauseLower, trig);
+      if(positions.length){
+        var pos = positions[positions.length - 1];
+        if(pos > bestPos){
+          bestPos = pos;
+          bestSlot = slot;
+        }
+      }
+    }
+  }
+  return bestSlot;
+}
+
+
+function BTT_nearbyMatch(textLower, triggerLower, traitLower, window){
+  window = (typeof window === "number") ? window : 80;
+
+
+  var idx = textLower.indexOf(triggerLower);
+  if(idx === -1) return false;
+
+
+  var start = Math.max(0, idx - window);
+  var end   = Math.min(textLower.length, idx + window);
+  var slice = textLower.slice(start, end);
+
+
+  return BTT_wordMatch(slice, traitLower);
+}
+
+
+function BTT_resolveTargetToSlot(targetRaw){
+  var tok = String(targetRaw || "").trim().toLowerCase();
+  if(!tok) return null;
+
+
+  if(BTT_SLOTS.indexOf(tok) !== -1) return tok;
+
+
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    var triggers = BTT_SLOT_TRIGGERS[slot] || [];
+    for(var t=0;t<triggers.length;t++){
+      if(String(triggers[t]).toLowerCase() === tok) return slot;
+    }
+  }
+  return null;
+}
+
+
+/* ------------------------- NARRATIVE FILTER ----------------------------- */
+
+
+function BTT_isNarrative(text){
+  if(!text || typeof text !== "string") return false;
+
+
+  if(text.indexOf("Available Classes") !== -1) return false;
+  if(text.indexOf("Resources:") !== -1) return false;
+  if(text.indexOf("Stats:") !== -1) return false;
+
+
+  var listMarks = (text.match(/^\s*[-*•]\s+/gm) || []).length;
+  if(listMarks >= 3) return false;
+
+
+  return true;
+}
+
+
+/* ------------------------------ STATE ----------------------------------- */
+
+
+function BTT_ensureState(){
+  if(typeof state === "undefined" || !state) state = {};
+  if(!state.BTT) state.BTT = {};
+  if(!state.BTT.characters) state.BTT.characters = {};
+  if(typeof state.BTT._showHelp === "undefined") state.BTT._showHelp = false;
+}
+
+
+function BTT_newSlotState(){
+  return {
+    traits: [],
+    femininity: 0,
+    fertility: null,
+    virility: null
+  };
+}
+
+
+function BTT_initReproBySlot(slotState, slot){
+  if(!slotState || !slot) return;
+
+
+  if(slot === "penis" && slotState.virility === null) slotState.virility = 20;
+  if(slot === "vagina" && slotState.fertility === null) slotState.fertility = 20;
+  if(slot === "ass" && slotState.fertility === null) slotState.fertility = 0;
+}
+
+
+function BTT_applyReproFromTraits(slotState){
+  if(!slotState || !slotState.traits) return;
+
+
+  var has = function(t){ return slotState.traits.indexOf(t) !== -1; };
+
+
+  if((has("pussy") || has("vaginal")) && slotState.fertility === null){
+    slotState.fertility = 20;
+  }
+  if((has("cock") || has("penile")) && slotState.virility === null){
+    slotState.virility = 20;
+  }
+}
+
+
+function BTT_ensureCharacter(characterName){
+  BTT_ensureState();
+  if(!characterName) characterName = "Player";
+
+
+  if(!state.BTT.characters[characterName]){
+    state.BTT.characters[characterName] = { __initialized:false, gender:"" };
+    for(var i=0;i<BTT_SLOTS.length;i++){
+      var slot = BTT_SLOTS[i];
+      state.BTT.characters[characterName][slot] = BTT_newSlotState();
+      BTT_initReproBySlot(state.BTT.characters[characterName][slot], slot);
+    }
+  } else {
+    for(var j=0;j<BTT_SLOTS.length;j++){
+      var sl = BTT_SLOTS[j];
+      if(!state.BTT.characters[characterName][sl]){
+        state.BTT.characters[characterName][sl] = BTT_newSlotState();
+      }
+      BTT_initReproBySlot(state.BTT.characters[characterName][sl], sl);
+    }
+    if(typeof state.BTT.characters[characterName].__initialized === "undefined"){
+      state.BTT.characters[characterName].__initialized = false;
+    }
+    if(typeof state.BTT.characters[characterName].gender === "undefined"){
+      state.BTT.characters[characterName].gender = "";
+    }
+  }
+
+
+  return state.BTT.characters[characterName];
+}
+
+
+/* ----------------------- STORY CARD HELPERS ----------------------------- */
+
+
+function BTT_hasStoryCards(){
+  return (typeof storyCards !== "undefined" && storyCards);
+}
+
+
+function BTT_slotTitle(characterName, slot){
+  return "BTT | " + characterName + " | " + slot;
+}
+
+
+function BTT_getOrCreateSlotCard(characterName, slot){
+  if(!BTT_hasStoryCards()) return null;
+
+
+  var title = BTT_slotTitle(characterName, slot);
+  var sc = storyCards.find(function(c){ return c.title === title; });
+
+
+  if(!sc){
+    addStoryCard(title, "Blank", "Anatomy");
+    sc = storyCards.find(function(c){ return c.title === title; });
+    if(sc){
+      sc.keys = (BTT_SLOT_TRIGGERS[slot] || []).join(", ");
+      sc.entry =
+        characterName.toUpperCase() + " ANATOMY — " + slot.toUpperCase() + "\n\n" +
+        "Traits:\n - (none)\n";
+    }
+  }
+  return sc;
+}
+
+
+function BTT_writeSlot(characterName, slot){
+  if(!BTT_hasStoryCards()) return;
+
+
+  var ch = BTT_ensureCharacter(characterName);
+  var s = ch[slot];
+  if(!s || !s.traits || !s.traits.length) return;
+
+
+  BTT_initReproBySlot(s, slot);
+  BTT_applyReproFromTraits(s);
+
+
+  var sc = BTT_getOrCreateSlotCard(characterName, slot);
+  if(!sc) return;
+
+
+  var lines = [];
+  lines.push(characterName.toUpperCase() + " ANATOMY — " + slot.toUpperCase());
+  lines.push("");
+  lines.push("Traits:");
+  for(var i=0;i<s.traits.length;i++) lines.push(" - " + s.traits[i]);
+  lines.push("");
+  lines.push("Femininity: " + s.femininity + "  (range -100..+100; 0 = androgynous)");
+  if(s.fertility !== null) lines.push("Fertility: " + s.fertility + "/100");
+  if(s.virility !== null) lines.push("Virility: " + s.virility + "/100");
+
+
+  sc.entry = lines.join("\n");
+}
+
+
+function BTT_writeAll(characterName){
+  var ch = BTT_ensureCharacter(characterName);
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    if(ch[slot] && ch[slot].traits && ch[slot].traits.length){
+      BTT_writeSlot(characterName, slot);
+    }
+  }
+}
+
+
+/* ----------------------- TRAIT APPLICATION ------------------------------ */
+
+
+function BTT_applyTrait(characterName, slot, trait){
+  if(!characterName) characterName = "Player";
+  if(!slot || BTT_SLOTS.indexOf(slot) === -1) return;
+
+
+  var ch = BTT_ensureCharacter(characterName);
+  var s = ch[slot];
+
+
+  var t = String(trait || "").trim().toLowerCase();
+  if(!t) return;
+  if(!/^[a-z0-9][a-z0-9-]*$/.test(t)) return;
+
+
+  if(s.traits.indexOf(t) === -1){
+    s.traits.push(t);
+  }
+
+
+  BTT_initReproBySlot(s, slot);
+  BTT_applyReproFromTraits(s);
+  BTT_writeSlot(characterName, slot);
+}
+
+
+function BTT_applyTraits(characterName, slot, traits){
+  if(!traits || !traits.length) return;
+  for(var i=0;i<traits.length;i++){
+    BTT_applyTrait(characterName, slot, traits[i]);
+  }
+}
+
+
+/* ----------------------- STAT MODIFICATION ------------------------------ */
+
+
+function BTT_modifyFemininity(characterName, slot, delta){
+  var ch = BTT_ensureCharacter(characterName);
+  delta = Number(delta) || 0;
+
+
+  if(slot){
+    var s = ch[slot];
+    if(s && typeof s.femininity === "number"){
+      s.femininity = BTT_clamp(s.femininity + delta, -100, 100);
+      BTT_writeSlot(characterName, slot);
+    }
+  } else {
+    var d = Math.round(delta / 2);
+    for(var i=0;i<BTT_SLOTS.length;i++){
+      var sl = BTT_SLOTS[i];
+      var ss = ch[sl];
+      if(ss && typeof ss.femininity === "number"){
+        ss.femininity = BTT_clamp(ss.femininity + d, -100, 100);
+      }
+    }
+    BTT_writeAll(characterName);
+  }
+}
+
+
+function BTT_modifyRepro(characterName, slot, stat, delta){
+  var ch = BTT_ensureCharacter(characterName);
+  delta = Number(delta) || 0;
+  if(stat !== "fertility" && stat !== "virility") return;
+
+
+  if(slot){
+    var s = ch[slot];
+    if(s && typeof s[stat] === "number"){
+      s[stat] = BTT_clamp(s[stat] + delta, 0, 100);
+      BTT_writeSlot(characterName, slot);
+    }
+  } else {
+    var d = Math.round(delta / 2);
+    for(var i=0;i<BTT_SLOTS.length;i++){
+      var sl = BTT_SLOTS[i];
+      var ss = ch[sl];
+      if(ss && typeof ss[stat] === "number"){
+        ss[stat] = BTT_clamp(ss[stat] + d, 0, 100);
+      }
+    }
+    BTT_writeAll(characterName);
+  }
+}
+
+
+/* ----------------------- GENDER BASELINES ------------------------------- */
+
+
+var BTT_GENDERS = {
+  male:   ["male","man","boy"],
+  female: ["female","woman","girl"],
+  futa:   ["futa","futanari"],
+  herm:   ["herm","hermaphrodite"],
+  femboy: ["femboy"]
+};
+
+
+function BTT_genderFemBaseline(g){
+  if(g === "male") return -50;
+  if(g === "female") return 50;
+  if(g === "herm") return 0;
+  if(g === "futa") return 25;
+  if(g === "femboy") return -25;
+  return 0;
+}
+
+
+/* Strip commands and common “lists” that cause stray gender words. */
+function BTT_sanitizeForGender(text){
+  var s = String(text || "");
+
+
+  // Remove /btt... commands entirely
+  s = s.replace(/\/btt[a-z]+\b[^\n\r]*/ig, " ");
+
+
+  // Remove obvious slash-command-like blocks
+  s = s.replace(/\/\w+\b[^\n\r]*/g, " ");
+
+
+  // Reduce long list content (commas/slashes) by replacing with spaces
+  // (helps avoid "male/female/futa/herm" lists in setup text)
+  s = s.replace(/[\/|]/g, " ");
+  s = s.replace(/\s+/g, " ").trim();
+
+
+  // Only use first chunk (initial description tends to be early)
+  if(s.length > 500) s = s.slice(0, 500);
+
+
+  return s;
+}
+
+
+/* Anchor-based gender detection:
+   - find positions of anchor words ("you", "player", etc.)
+   - find positions of each gender keyword
+   - choose the gender keyword with smallest distance to any anchor
+*/
+function BTT_detectGenderAnchored(text){
+  var s = BTT_sanitizeForGender(text).toLowerCase();
+  if(!s) return null;
+
+
+  var anchors = ["you","your","player","character","i am","i'm","im "];
+  var anchorPos = [];
+
+
+  for(var a=0;a<anchors.length;a++){
+    var p = s.indexOf(anchors[a]);
+    if(p !== -1) anchorPos.push(p);
+  }
+
+
+  // if no anchor, we still allow detection but it’s weaker; we’ll prefer the LAST match
+  var hasAnchor = anchorPos.length > 0;
+
+
+  var bestGender = null;
+  var bestScore = Infinity;
+  var bestPos = -1;
+
+
+  // Evaluate ALL matches for all genders
+  for(var g in BTT_GENDERS){
+    if(!BTT_GENDERS.hasOwnProperty(g)) continue;
+
+
+    var words = BTT_GENDERS[g];
+    for(var w=0; w<words.length; w++){
+      var kw = words[w].toLowerCase();
+      var positions = BTT_findAllWordPositions(s, kw);
+
+
+      for(var pi=0; pi<positions.length; pi++){
+        var pos = positions[pi];
+
+
+        var score;
+        if(hasAnchor){
+          var minDist = Infinity;
+          for(var ai=0; ai<anchorPos.length; ai++){
+            minDist = Math.min(minDist, Math.abs(pos - anchorPos[ai]));
+          }
+          score = minDist;
+        } else {
+          // no anchor: prefer later matches (more likely to be actual declaration)
+          score = 100000 - pos;
+        }
+
+
+        // prefer smaller score; tie-breaker: later position wins
+        if(score < bestScore || (score === bestScore && pos > bestPos)){
+          bestScore = score;
+          bestGender = g;
+          bestPos = pos;
+        }
+      }
+    }
+  }
+
+
+  return bestGender;
+}
+
+
+function BTT_generateBaseline(characterName, gender){
+  var ch = BTT_ensureCharacter(characterName);
+
+
+  // set fem baseline across all parts
+  var femBase = BTT_genderFemBaseline(gender);
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    ch[BTT_SLOTS[i]].femininity = femBase;
+  }
+
+
+  // always-human base slots (nipples default regardless of gender)
+  var baseSlots = ["head","hair","arms","legs","gut","ass","nipples"];
+  for(var b=0;b<baseSlots.length;b++){
+    BTT_applyTrait(characterName, baseSlots[b], "human");
+  }
+
+
+  // gender-specific baseline anatomy
+  if(gender === "male"){
+    BTT_applyTrait(characterName, "penis", "human");
+  } else if(gender === "female"){
+    BTT_applyTrait(characterName, "breasts", "human");
+    BTT_applyTrait(characterName, "vagina", "human");
+  } else if(gender === "futa"){
+    BTT_applyTrait(characterName, "breasts", "human");
+    BTT_applyTrait(characterName, "penis", "human");
+    BTT_applyTrait(characterName, "vagina", "human");
+  } else if(gender === "herm"){
+    BTT_applyTrait(characterName, "penis", "human");
+    BTT_applyTrait(characterName, "vagina", "human");
+  } else if(gender === "femboy"){
+    BTT_applyTrait(characterName, "penis", "human");
+  }
+
+
+  BTT_writeAll(characterName);
+}
+
+
+/* ----------------------- HELP TEXT + COMMANDS --------------------------- */
+
+
+function BTT_helpText(){
+  return [
+    "=== BODY TRANSFORMATION TRACKER (BTT) HELP ===",
+    "",
+    "BTT tracks transformations per body-part slot via Story Cards:",
+    "  BTT | Player | <slot>",
+    "",
+    "SLOTS:",
+    "- head, hair, arms, legs, breasts, nipples, gut, penis, vagina, ass, tail, wings",
+    "  (ass includes anus + cheeks + ass-region terms)",
+    "",
+    "STATS:",
+    "- Femininity: -100..+100 (0 = androgynous)",
+    "- Fertility: 0..100 (if applicable)",
+    "- Virility:  0..100 (if applicable)",
+    "",
+    "BASELINES:",
+    "- penis starts Virility 20",
+    "- vagina starts Fertility 20",
+    "- ass starts Fertility 0",
+    "- adding traits can unlock stats:",
+    "    pussy/vaginal => Fertility 20 if missing",
+    "    cock/penile   => Virility 20 if missing",
+    "",
+    "COMMANDS:",
+    "/btthelp",
+    "/bttadd <target> <trait1,trait2,...>",
+    "/bttfem [target] +/-N",
+    "/bttfert [target] +/-N",
+    "/bttvir [target] +/-N",
+    "",
+    "TARGETING:",
+    "- <target> can be a slot name OR any trigger word for that slot.",
+    "  Example: /bttadd asshole slime,demonic  -> targets ASS slot",
+    "============================================="
+  ].join("\n");
+}
+
+
+function BTT_handleManualCommands(text, characterName){
+  if(!text || typeof text !== "string") return text;
+  if(!characterName) characterName = "Player";
+
+
+  BTT_ensureCharacter(characterName);
+
+
+  // /btthelp
+  text = text.replace(/\/btthelp\b/ig, function(){
+    state.BTT._showHelp = true;
+    return "";
+  });
+
+
+  // /bttadd <target> <trait1,trait2,...>
+  text = text.replace(/\/bttadd\s+([^\s]+)\s+([^\n\r]+)/ig, function(_m, targetRaw, traitsRaw){
+    var slot = BTT_resolveTargetToSlot(targetRaw);
+    if(!slot) return "";
+
+
+    var parts = String(traitsRaw || "")
+      .split(",")
+      .map(function(s){ return s.trim().toLowerCase(); })
+      .filter(function(s){ return !!s; });
+
+
+    for(var i=0;i<parts.length;i++){
+      BTT_applyTrait(characterName, slot, parts[i]);
+    }
+    return "";
+  });
+
+
+  function parseTargetAndDelta(arg1, arg2){
+    // If only arg1 -> treat as delta (global)
+    if(typeof arg2 === "undefined" || arg2 === null){
+      var d0 = Number(arg1);
+      if(!isFinite(d0)) return null;
+      return { slot:null, delta:d0 };
+    }
+
+
+    // Otherwise arg1 is target, arg2 is delta
+    var slot = BTT_resolveTargetToSlot(arg1);
+    if(!slot) return null;
+
+
+    var d = Number(arg2);
+    if(!isFinite(d)) return null;
+
+
+    return { slot:slot, delta:d };
+  }
+
+
+  // /bttfem [target] +/-N
+  text = text.replace(/\/bttfem\s+([^\s]+)(?:\s+([+-]?\d+))?/ig, function(_m, a, b){
+    var parsed = parseTargetAndDelta(a, b);
+    if(!parsed) return "";
+    BTT_modifyFemininity(characterName, parsed.slot, parsed.delta);
+    return "";
+  });
+
+
+  // /bttfert [target] +/-N
+  text = text.replace(/\/bttfert\s+([^\s]+)(?:\s+([+-]?\d+))?/ig, function(_m, a, b){
+    var parsed = parseTargetAndDelta(a, b);
+    if(!parsed) return "";
+    BTT_modifyRepro(characterName, parsed.slot, "fertility", parsed.delta);
+    return "";
+  });
+
+
+  // /bttvir [target] +/-N
+  text = text.replace(/\/bttvir\s+([^\s]+)(?:\s+([+-]?\d+))?/ig, function(_m, a, b){
+    var parsed = parseTargetAndDelta(a, b);
+    if(!parsed) return "";
+    BTT_modifyRepro(characterName, parsed.slot, "virility", parsed.delta);
+    return "";
+  });
+
+
+  return text;
+}
+
+
+/* ----------------------- DETECTION CORE -------------------------------- */
+
+
+function BTT_detectTransformations(text, characterName){
+  if(!text || typeof text !== "string") return;
+  if(!characterName) characterName = "Player";
+  if(!BTT_isNarrative(text)) return;
+
+
+  var lower = text.toLowerCase();
+
+
+  /* Pass A: cock/pussy clause targeting */
+  var clauses = BTT_splitClauses(lower);
+  for(var ci=0; ci<clauses.length; ci++){
+    var clause = clauses[ci];
+    if(!clause) continue;
+
+
+    var lastSlot = BTT_lastSlotInClause(clause);
+
+
+    if(BTT_wordMatch(clause, "cock")){
+      if(lastSlot) BTT_applyTrait(characterName, lastSlot, "cock");
+      else BTT_applyTrait(characterName, "penis", "human");
+    }
+
+
+    if(BTT_wordMatch(clause, "pussy")){
+      if(lastSlot) BTT_applyTrait(characterName, lastSlot, "pussy");
+      else BTT_applyTrait(characterName, "vagina", "human");
+    }
+  }
+
+
+  /* Pass B: general trait detection */
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    var triggers = BTT_SLOT_TRIGGERS[slot] || [];
+    if(!triggers.length) continue;
+
+
+    for(var t=0;t<triggers.length;t++){
+      var trig = String(triggers[t]).toLowerCase();
+      if(!trig) continue;
+
+
+      if(!BTT_wordMatch(lower, trig)) continue;
+
+
+      var found = [];
+      for(var j=0;j<BTT_ALL_TRAITS.length;j++){
+        var trait = BTT_ALL_TRAITS[j];
+        if(BTT_nearbyMatch(lower, trig, trait, 80)){
+          found.push(trait);
+        }
+      }
+
+
+      if(found.length){
+        BTT_applyTraits(characterName, slot, found);
+      }
+    }
+  }
+}
+
+
+/* ============================================================================
+   CLEAN HOOK ENTRYPOINTS
+============================================================================ */
+
+
+function onInput_BTT(text){
+  var ch = BTT_ensureCharacter("Player");
+
+
+  // strip commands first so they can't accidentally trip gender detection
+  var textForGender = BTT_sanitizeForGender(text);
+
+
+  // initialize baseline once, using anchored detection
+  if(!ch.__initialized){
+    var g = BTT_detectGenderAnchored(textForGender);
+    if(g){
+      BTT_generateBaseline("Player", g);
+      ch.gender = g;
+      ch.__initialized = true;
+    }
+  }
+
+
+  // manual commands stripped from visible text
+  text = BTT_handleManualCommands(text, "Player");
+
+
+  // detect transformations in player input
+  BTT_detectTransformations(text, "Player");
+
+
+  return text;
+}
+
+
+function onContext_BTT(text){
+  return text;
+}
+
+
+function onOutput_BTT(text){
+  // detect transformations in AI output
+  BTT_detectTransformations(text, "Player");
+
+
+  // update story cards
+  BTT_writeAll("Player");
+
+
+  // show help if requested
+  if(state && state.BTT && state.BTT._showHelp){
+    state.BTT._showHelp = false;
+    text = BTT_helpText() + "\n\n" + text;
+  }
+
+
+  return text;
+}
+
+
+/* ============================================================================
+   END BTT LIBRARY
+============================================================================ */
