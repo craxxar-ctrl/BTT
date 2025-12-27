@@ -1,0 +1,16 @@
+const modifier = (text) => { 
+  // BTT hook (safe if missing)
+  if (typeof onInput_BTT === "function") {
+    text = onInput_BTT(text);
+  }
+
+  // Auto-Cards hook (optional, safe if missing)
+  if (typeof AutoCards === "function") {
+    text = AutoCards("input", text);
+  }
+
+  return { text };
+}//end of modifier
+
+// Don't modify this part
+modifier(text)

@@ -1,0 +1,38 @@
+const modifier = (text) => { 
+  // IMPORTANT: "stop" may not exist in some environments unless you declare it.
+  // We use a local variable to prevent ReferenceError blanking.
+  let localStop = (typeof stop === "boolean") ? stop : false;
+
+  // BTT hook (supports either return style: string OR [text, stop] OR {text, stop})
+  if (typeof onContext_BTT === "function") {
+    const out = onContext_BTT(text, localStop);
+
+    if (Array.isArray(out)) {
+      text = (typeof out[0] === "string") ? out[0] : text;
+      localStop = (typeof out[1] === "boolean") ? out[1] : localStop;
+    } else if (out && typeof out === "object") {
+      if (typeof out.text === "string") text = out.text;
+      if (typeof out.stop === "boolean") localStop = out.stop;
+    } else if (typeof out === "string") {
+      text = out;
+    }
+  }
+
+  // Auto-Cards hook (expects [text, stop] on context)
+  if (typeof AutoCards === "function") {
+    const out = AutoCards("context", text, localStop);
+
+    if (Array.isArray(out)) {
+      text = (typeof out[0] === "string") ? out[0] : text;
+      localStop = (typeof out[1] === "boolean") ? out[1] : localStop;
+    } else if (typeof out === "string") {
+      // Fallback: if AutoCards returns only text for some reason
+      text = out;
+    }
+  }
+
+  return { text, stop: localStop };
+}//end of modifier
+
+// Don't modify this part
+modifier(text)
