@@ -1,0 +1,4685 @@
+// === FORCED INIT PATCH ===
+// v2.63: Appearance card fallback + axis pseudo-trait sanitization + parser skips
+// Treat empty or descriptor-only anatomy as uninitialized.
+// Force baseline init exactly once, before any detection.
+
+/* ============================================================================
+   BODY TRANSFORMATION TRACKER (BTT) — v2.60 (DECOUPLED APPEARANCE AXES)
+   ---------------------------------------------------------------------------
+   This build introduces a fully independent appearance-axis system that is
+   divorced from slot/trait commit thresholds.
+
+   Key Outcomes
+   - Appearance axes are canonicalized and persisted in the anatomy story card.
+   - The PLAYER APPEARANCE (BTT) card is AI-authored from the appearance axes
+     (seeded from the earliest owned init prose, then refreshed via tagged output).
+   - Fertility/Virility + Breast/Ass/Cock size are tracked on 0..100 axes:
+       * 0..40  normal human range
+       * 20     average
+       * 41..60 rare/extreme human
+       * 61..100 hyper/magical
+   - Penis inches map rule: +1" length = +5 points past 20 (5" => 20).
+   - Breast cups mapped AA..U (DD == E) with explicit high-cup support.
+
+   Integration Notes
+   - No changes required to scenario tab wrappers.
+   - Slot/trait system runs first; axes update runs after it each pass.
+   - Axis persistence uses these labels in the anatomy card:
+       Breast Size:, Ass Size:, Cock Size:, Fertility:, Virility:
+============================================================================ */
+
+function BTT_isEffectivelyEmpty(meta){
+  if(!meta || !meta.slots) return true;
+  for(var k in meta.slots){
+    if(!meta.slots.hasOwnProperty(k)) continue;
+    var s = meta.slots[k];
+    if(s && s.traits && s.traits.length){
+      // ignore descriptor-only noise traits that shouldn't block baseline sex init
+      if(!(s.traits.length===1 && (s.traits[0]==="coiling" || s.traits[0]==="slick"))){
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+
+/* ============================================================================
+   BODY TRANSFORMATION TRACKER (BTT) — v2.42 (clarity/flow/notation refactor + inheritance fixes)
+   ---------------------------------------------------------------------------
+   Focus fixes from  (based on your latest test results):
+   ✅ Debug goes ONLY to the STORY CARD Notes/Description (plain text).
+      - The anatomy entry never contains debug.
+      - Any existing JSON-looking Notes will be overwritten.
+   ✅ No "human everywhere" slot initialization.
+      - Slots default to "none" (absent) unless baseline or detected.
+      - Baseline assumes HUMAN as race only; sex/gender still follows BTT v1 identity-only init.
+      - If gender is male: penis exists, vagina is none. Female: vagina exists, penis is none.
+   ✅ Slots can be CREATED by strong clause targeting + committed traits.
+   ✅ "alien sensation/feeling/presence" is treated as NON-anatomical language:
+      - adds a metaphor/noise penalty instead of creating an "alien" trait.
+   ✅ Explicit self-diagnosis clauses (e.g., "you think you've been infested...")
+      get a confidence boost when paired with a hard-change signal + a slot cue.
+============================================================================ */
+
+
+/* ---------------------------------------------------------------------------
+   MAINTAINER NOTES (professional readability pass)
+   ---------------------------------------------------------------------------
+   Canon & Storage
+   - Story Card ENTRY is canonical anatomy only (human-readable, no JSON).
+   - Story Card DESCRIPTION/NOTES is debug only (plain text). No JSON.
+   - state.BTT is a working cache; it must never be treated as canonical.
+
+   Evidence Model
+   - Clause: smallest scoring unit (rough sentence/segment).
+   - Window (W#): paragraph-bounded clause range used to collect nearby evidence and
+     provide debug provenance. W# resets each turn.
+   - Seed: a (window, slot-candidate) pairing. If multiple slots score within
+     slot_dominance_gap, *one window yields multiple seeds*.
+     - Window identity does NOT change when splitting.
+     - Optional debug-only sublabels may appear as W1.1 / W1.2, etc.
+   - Group (G#): merged evidence for (owner|slot). Groups may be reinforced by
+     decayed history, but slot dominance channels are MAX-merged to avoid inflation.
+
+   ID Policy
+   - W# ids are per-turn and used only for debug/provenance.
+   - G# ids are global/stable for the life of the run:
+     - Allocated once per turn-snapshot in BTT_storeGroups.
+     - Preserved through history merges.
+     - Never reallocated in apply/formatting passes.
+
+   Layout / Reading Order
+   1) Slots + triggers
+   2) Trait tokens + change signals
+   3) Config + state helpers
+   4) Story-card I/O
+   5) Baseline init (identity-only)
+   6) Text processing (clauses, windows, slot evidence)
+   7) Aggregation (windows -> seeds -> groups)
+   8) History + decay
+   9) Proposals + commit
+  10) Context injection
+  11) Hooks (input/context/output)
+--------------------------------------------------------------------------- */
+
+/* ----------------------------- SLOTS ----------------------------------- */
+
+var BTT_SLOTS = [
+  "head","arms","legs",
+  "breasts","gut",
+  "penis","vagina","ass",
+  "tail","wings",
+  "misc"
+];
+
+// Slot nouns derived from triggers (used for structural mention detection)
+var BTT_SLOT_NOUNS = {
+  head:   ["head","face","eyes","eye","skull","hair","scalp"],
+  arms:   ["arm","arms","hand","hands","finger","fingers"],
+  legs:   ["leg","legs","thigh","thighs","calf","calves","foot","feet"],
+  breasts:["breast","breasts","boob","boobs","chest","tits"],
+  gut:    ["gut","belly","stomach","abdomen"],
+  penis:  ["penis","cock","dick","shaft","member"],
+  vagina: [ "vagina", "pussy", "cunt", "slit", "womb", "uterus", "clit", "clitoris", "labia" ],
+  ass:    [ "ass", "butt", "cheek", "cheeks", "anus", "asshole" ],
+  tail:   ["tail"],
+  wings:  ["wing","wings"],
+  misc:   []
+};
+
+var BTT_SLOT_TRIGGERS = {
+  head:    ["head","face","skull","jaw","eyes","mouth", "hair", "locks", "mane", "scalp"],
+  arms:    ["arm","arms","hand","hands","finger","fingers","armpit","armpits"],
+  legs:    ["leg","legs","thigh","thighs","calf","calves","foot","feet"],
+  breasts: ["breast","breasts","boobs","chest","nipple","nipples","areola","areolae"],
+  gut:     ["waist","belly","stomach","abdomen","gut"],
+  penis:   ["penis","cock","dick","shaft","member","phallus"],
+  vagina:  ["vagina","pussy","cunt","slit"],
+  ass:     ["ass","butt","cheek","cheeks","anus","asshole","rear","sphincter"],
+  tail:    ["tail"],
+  wings:   ["wing","wings"],
+  misc:    []
+};
+
+var BTT_WEAK_TARGETS = {
+  appendage: { slots:["tail","penis","arms","legs"], score:0.10 },
+  extension: { slots:["tail","penis","arms"], score:0.10 },
+  growth:    { slots:["breasts","ass","penis","tail"], score:0.10 },
+  tip:       { slots:["tail","penis"], score:0.06 },
+  slit:      { slots:["vagina","ass","tail","arms","legs","breasts"], score:0.06 },
+  "morning wood": { slots:["penis"], score:0.06 },
+  "erection":     { slots:["penis"], score:0.06 },
+};
+
+
+// Ambiguous "hole/opening" structural cues. These are treated as WEAK evidence and can
+// split a window into multiple hole slots (oral/head, vaginal, anal/ass) via gap logic.
+var BTT_HOLE_EVIDENCE = {
+  "opening": { map:{ head:0.06, vagina:0.06, ass:0.06 } },
+  "hole":    { map:{ head:0.06, vagina:0.06, ass:0.06 } },
+  "orifice": { map:{ head:0.06, vagina:0.06, ass:0.06 } }
+};
+
+
+
+var BTT_LOCATION_ANCHORS = {
+  /* -----------------------------------------------------------------
+     LOCATION / ORIGIN LANDMARKS (adjacency-based)
+     - These anchors contribute ONLY to the "location" channel.
+     - No ownership is inferred from landmarks.
+     - Anchors may target multiple adjacent slots with different weights.
+     - If you need equal weights for a phrase, set the same value for each.
+     ----------------------------------------------------------------- */
+
+  /* Groin / crotch region */
+  "groin":               { map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "crotch":              { map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "between your thighs": { map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "between his thighs":  { map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "between her thighs":  { map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "between their thighs":{ map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "between your legs":   { map:{ penis:0.14, vagina:0.14, ass:0.14, legs:0.14, tail:0.07 } },
+  "inner thigh":         { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "inner thighs":        { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+
+  /* Containment adjacency (regional): "around your thigh" etc.
+     Treated as location/adjacency phrases and evaluated BEFORE ownership/mention tiers.
+     These are ambiguous and follow the same adjacency-map distribution as inner-thigh / between-legs cues. */
+  "around your thigh":        { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around your thighs":       { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around his thigh":         { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around her thigh":         { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around their thigh":       { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around his thighs":        { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around her thighs":        { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "around their thighs":      { map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "coiling around your thigh":{ map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "coiling around your thighs":{ map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "wrapped around your thigh":{ map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "wrapped around your thighs":{ map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "curling around your thigh":{ map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+  "curling around your thighs":{ map:{ penis:0.12, vagina:0.12, ass:0.12, legs:0.12, tail:0.06 } },
+
+
+  /* Lower abdomen (no legs; weaker tail/penis/vagina) */
+  "lower belly":         { map:{ gut:0.16, penis:0.08, vagina:0.08, tail:0.06 } },
+  "lower abdomen":       { map:{ gut:0.16, penis:0.08, vagina:0.08, tail:0.06 } },
+  "below the navel":     { map:{ gut:0.16, penis:0.08, vagina:0.08, tail:0.06 } },
+  "waistline":           { map:{ gut:0.14, penis:0.07, vagina:0.07, tail:0.05 } },
+  "just above the hips": { map:{ gut:0.14, penis:0.07, vagina:0.07, tail:0.05 } },
+  "hips":                { map:{ gut:0.12, penis:0.06, vagina:0.06, tail:0.04 } },
+
+  /* Posterior origin / attachment */
+  "cleft of your ass":   { map:{ ass:0.12, tail:0.12 } }, /* equal adjacency */
+  "cleft of his ass":    { map:{ ass:0.12, tail:0.12 } },
+  "cleft of her ass":    { map:{ ass:0.12, tail:0.12 } },
+  "cleft of their ass":  { map:{ ass:0.12, tail:0.12 } },
+  "butt crack":          { map:{ ass:0.12, tail:0.12 } },
+  "between your cheeks": { map:{ ass:0.12, tail:0.12 } },
+  /* Phrase-specialization: treat "ass cheeks" as posterior, and mask generic "cheeks" tokens. */
+  "ass cheeks":               { map:{ ass:0.18, tail:0.16 } },
+  "ass cheek":                { map:{ ass:0.18, tail:0.16 } },
+  "your ass cheeks":          { map:{ ass:0.18, tail:0.16 } },
+  "cleft of your ass cheeks": { map:{ tail:0.18, ass:0.12 } },
+  "from the cleft of your ass": { map:{ tail:0.18, ass:0.10 } }, /* origin-biased allowed */
+
+  "tailbone":            { map:{ tail:0.20, ass:0.12 } }, /* no legs */
+  "coccyx":              { map:{ tail:0.20, ass:0.12 } },
+  "base of your spine":  { map:{ tail:0.20, ass:0.12 } },
+  "base of his spine":   { map:{ tail:0.20, ass:0.12 } },
+  "base of her spine":   { map:{ tail:0.20, ass:0.12 } },
+  "base of their spine": { map:{ tail:0.20, ass:0.12 } },
+  "lower spine":         { map:{ tail:0.18, ass:0.10 } },
+
+  /* Lower back (no legs; weaker ass; very weak gut; very weak wings) */
+  "lower back":          { map:{ tail:0.16, ass:0.08, gut:0.04, wings:0.04 } },
+  "small of your back":  { map:{ tail:0.16, ass:0.08, gut:0.04, wings:0.04 } },
+  "small of his back":   { map:{ tail:0.16, ass:0.08, gut:0.04, wings:0.04 } },
+  "small of her back":   { map:{ tail:0.16, ass:0.08, gut:0.04, wings:0.04 } },
+  "small of their back": { map:{ tail:0.16, ass:0.08, gut:0.04, wings:0.04 } },
+
+  /* Chest / torso (no arms; gut very weak) */
+  "chest":               { map:{ breasts:0.18, gut:0.04 } },
+  "sternum":             { map:{ breasts:0.18, gut:0.04 } },
+  "torso":               { map:{ breasts:0.16, gut:0.04 } },
+  "front of your body":  { map:{ breasts:0.16, gut:0.04 } },
+  "pecs":                { map:{ breasts:0.18, gut:0.04 } },
+
+  /* Armpit / underarm (no neck slot) */
+  "armpit":              { map:{ arms:0.18, breasts:0.06 } },
+  "armpits":             { map:{ arms:0.18, breasts:0.06 } },
+  "underarm":            { map:{ arms:0.18, breasts:0.06 } },
+  "underarms":           { map:{ arms:0.18, breasts:0.06 } },
+  "beneath your arm":    { map:{ arms:0.18, breasts:0.06 } },
+  "beneath his arm":     { map:{ arms:0.18, breasts:0.06 } },
+  "beneath her arm":     { map:{ arms:0.18, breasts:0.06 } },
+  "beneath their arm":   { map:{ arms:0.18, breasts:0.06 } },
+
+  /* Shoulder / collarbone (equal arms/head/wings) */
+  "shoulder":            { map:{ arms:0.14, head:0.14, wings:0.14 } },
+  "shoulders":           { map:{ arms:0.14, head:0.14, wings:0.14 } },
+  "collarbone":          { map:{ arms:0.14, head:0.14, wings:0.14 } },
+  "collarbones":         { map:{ arms:0.14, head:0.14, wings:0.14 } },
+  "clavicle":            { map:{ arms:0.14, head:0.14, wings:0.14 } },
+  "clavicles":           { map:{ arms:0.14, head:0.14, wings:0.14 } },
+  "top of your shoulder":{ map:{ arms:0.14, head:0.14, wings:0.14 } },
+
+  /* Upper back / shoulder blades (equal arms/wings) */
+  "shoulder blade":      { map:{ arms:0.12, wings:0.12 } },
+  "shoulder blades":     { map:{ arms:0.12, wings:0.12 } },
+  "upper back":          { map:{ arms:0.12, wings:0.12 } },
+  "between your shoulder blades": { map:{ arms:0.12, wings:0.12 } },
+
+  /* Head region only (neck/throat/face terms map to head) */
+  "neck":                { map:{ head:0.16 } },
+  "throat":              { map:{ head:0.16 } },
+  "nape":                { map:{ head:0.16 } },
+  "under your chin":     { map:{ head:0.16 } },
+  "face":                { map:{ head:0.16 } },
+  "skull":               { map:{ head:0.16 } },
+  "forehead":            { map:{ head:0.16 } },
+  "cheek":               { map:{ head:0.16 } },
+  "cheeks":              { map:{ head:0.16 } },
+  "jaw":                 { map:{ head:0.16 } },
+
+  /* Hip / glute / upper thigh (butt is a direct ass term; tail weaker here) */
+  "hip":                 { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "hips":                { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "glute":               { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "glutes":              { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "upper thigh":         { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "upper thighs":        { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "outer thigh":         { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+  "outer thighs":        { map:{ legs:0.14, ass:0.14, penis:0.10, vagina:0.10, tail:0.06 } },
+
+// Regional/ambiguous: "cheeks" here can refer to butt cheeks (cleft area) and may relate to multiple slots.
+// These phrases should (a) mask face "cheek/cheeks" tokens, and (b) contribute multi-slot adjacency (no slot privilege).
+"between the cheeks of your ass": { map:{ ass:0.18, tail:0.16, vagina:0.12, penis:0.12 } },
+"between your ass cheeks":        { map:{ ass:0.18, tail:0.16, vagina:0.12, penis:0.12 } },
+"between your cheeks":            { map:{ ass:0.16, tail:0.14, vagina:0.10, penis:0.10 } }
+};
+
+/* ----------------------------- TRAITS ---------------------------------- */
+/* NOTE: "alien" removed as a promotable trait; handled as a metaphor/noise signal instead. */
+
+var BTT_TRAIT_TOKENS = [
+  "prehensile","coiled","coiling","tentacled","segmented","sinuous","muscular",
+  "smooth","slick","glistening","sticky","wet","oily","velvety","opalescent","ribbed","ridged","knotted",
+  "anal","oral","vaginal",
+  "parasite","parasitic","symbiote","symbiotic","slime","ooze",
+  "pussy",
+  "foreign"
+];
+
+/* --------------------------- CHANGE SIGNALS ----------------------------- */
+
+var BTT_CHANGE_HARD = [
+  "transform","transforms","transformed","transformation",
+  "morph","morphs","morphed","shift","shifts","shifted",
+  "change","changes","changed","changed into","turn into","turned into",
+  "become","becomes","became",
+  "mutate","mutates","mutated",
+  "sprout","sprouts","sprouted",
+  "grow","grows","grew","grown",
+  "infest","infests","infested","infestation",
+  "infesting",
+  "take root",
+  "taken root",
+  "taken root inside",
+  "took root",
+  "rooted",
+  "taken root inside you",
+  "taken root inside"
+];
+
+
+/* ---------------------------------------------------------------------------
+   CHANGE SIGNAL MATCHING (boundary-aware)
+   ---------------------------------------------------------------------------
+   IMPORTANT:
+   - Hard-change triggers must not fire on partial-word matches (e.g., "transform" inside "transformative").
+   - Some derived nouns/adjectives are semantically weaker (e.g., "transformation", "infestation", "transformative").
+   - We model these weaker forms explicitly so logs remain interpretable.
+--------------------------------------------------------------------------- */
+
+// HARD: true transformation events (present/past/continuous verb forms)
+var BTT_CHANGE_HARD_PATTERNS = [
+  { key:"transform", re:/\btransform(?:s|ed|ing)?\b/i },
+  { key:"morph",     re:/\bmorph(?:s|ed|ing)?\b/i },
+  { key:"shift",     re:/\bshift(?:s|ed|ing)?\b/i },
+  { key:"change",    re:/\bchange(?:s|d)?\b/i },
+  { key:"become",    re:/\bbecome(?:s)?\b|\bbecame\b/i },
+  { key:"mutate",    re:/\bmutat(?:e|es|ed|ing)\b/i },
+  { key:"sprout",    re:/\bsprout(?:s|ed|ing)?\b/i },
+  { key:"grow",      re:/\bgrow(?:s|ing)?\b|\bgrew\b|\bgrown\b/i },
+  { key:"infest",    re:/\binfest(?:s|ed|ing)?\b/i },
+  { key:"take root", re:/\btake root\b|\btook root\b|\btaken root\b|\brooted\b/i }
+];
+
+// SOFT: semantically weaker / often descriptive forms (not necessarily an observed event)
+// These contribute reduced confidence via the Status channel.
+var BTT_CHANGE_SOFT_PATTERNS = [
+  { key:"transformative", re:/\btransformative\b/i, v:0.15 },
+  { key:"transformation", re:/\btransformation\b/i, v:0.20 },
+  { key:"infestation", re:/\binfestation\b/i, v:0.20 }
+];
+
+function BTT_anyPattern(textLower, patterns){
+  if(!patterns || !patterns.length) return null;
+  for(var i=0;i<patterns.length;i++){
+    var p = patterns[i];
+    if(p && p.re && p.re.test(textLower)) return p;
+  }
+  return null;
+}
+
+var BTT_CHANGE_PRESENCE = [
+  "reveal","reveals","revealed","revealing",
+  "expose","exposes","exposed","exposing",
+  "emerge","emerges","emerged","emerging",
+  "appear","appears","appeared","appearing",
+  "there is","there's","now has","suddenly has"
+];
+
+var BTT_STATUS = ["new","newly","suddenly","now","different","altered","changed appearance","changed body"];
+var BTT_METAPHOR = ["like","as if","almost","seems","seemingly","resembles","similar to","kind of","sort of"];
+
+/* Self-diagnosis / explicit realization phrases:
+   Boost confidence ONLY when paired with hard-change language + some slot cue. */
+var BTT_SELF_DIAGNOSIS = [
+  "you think", "you realize", "you suspect", "you discover", "you notice",
+  "you can tell", "you figure out", "it dawns on you"
+];
+
+
+/* ---------------------- SELF-SLOT TRAIT BLOCK --------------------------
+   General rule:
+   - Structural/genital tokens like "pussy", "cock", "anus" are useful as EVIDENCE
+     for targeting, but they are redundant as stored traits on their "home" slot.
+   - We block a slot from gaining its own structural trait, while still allowing
+     those tokens to bind to OTHER slots (e.g., tail pussy).
+------------------------------------------------------------------------- */
+
+var BTT_SELF_SLOT_TRAITS = {
+  vagina: ["vagina","pussy","cunt","slit","opening"],
+  penis:  ["penis","cock","dick","shaft","member","phallus"],
+  ass:    ["ass","butt","cheek","cheeks","anus","asshole","rear","sphincter"]
+};
+
+function BTT_isSelfSlotTrait(slot, trait){
+  slot = String(slot||"").toLowerCase();
+  trait = String(trait||"").toLowerCase();
+  var arr = BTT_SELF_SLOT_TRAITS[slot];
+  if(!arr) return false;
+  return arr.indexOf(trait) !== -1;
+}
+
+/* Store a trait on a slot. Returns true if stored, false if skipped. */
+function BTT_addTrait(meta, slot, trait, cfg){
+  if(!meta || !meta.slots) return false;
+  slot = String(slot||"").toLowerCase();
+  trait = String(trait||"").toLowerCase().trim();
+  if(!trait) return false;
+
+  // Block storing structural traits on their own home slot (still counts as evidence).
+  if(BTT_isSelfSlotTrait(slot, trait)) return false;
+
+  if(!meta.slots[slot]){
+    meta.slots[slot] = { traits:["human"], fertility:null, fertilityConf:0, virility:null, virilityConf:0, updatedTurn:BTT_getTurn() };
+  }
+  if(!meta.slots[slot].traits) meta.slots[slot].traits = ["human"];
+
+  if(meta.slots[slot].traits.indexOf(trait)===-1){
+    meta.slots[slot].traits.push(trait);
+
+    // Fertility/Virility initialization rules:
+    // - When a slot gains vaginal capability, fertility initializes to 20 (baseline human) if unset.
+    // - When a slot gains penile capability, virility initializes to 20 if unset.
+    // - Anal/oral fertility init to 0 if enabled in config.
+    if(cfg){
+      var t = trait;
+      if((t==="vaginal" || t==="vagina" || t==="pussy") && typeof meta.slots[slot].fertility !== "number"){
+        meta.slots[slot].fertility = 20;
+        meta.slots[slot].fertilityConf = Math.max(meta.slots[slot].fertilityConf||0, 0.50);
+      }
+      if((t==="penile" || t==="penis" || t==="cock" || t==="dick") && typeof meta.slots[slot].virility !== "number"){
+        meta.slots[slot].virility = 20;
+        meta.slots[slot].virilityConf = Math.max(meta.slots[slot].virilityConf||0, 0.50);
+      }
+      if((t==="anal") && cfg.fertility_scope_anal && typeof meta.slots[slot].fertility !== "number"){
+        meta.slots[slot].fertility = 0;
+        meta.slots[slot].fertilityConf = Math.max(meta.slots[slot].fertilityConf||0, 0.40);
+      }
+      if((t==="oral") && cfg.fertility_scope_oral && typeof meta.slots[slot].fertility !== "number"){
+        meta.slots[slot].fertility = 0;
+        meta.slots[slot].fertilityConf = Math.max(meta.slots[slot].fertilityConf||0, 0.40);
+      }
+    }
+
+    meta.slots[slot].updatedTurn = BTT_getTurn();
+    return true;
+  }
+  // Even when not (re)initializing, we update appearance/species cache from new owned descriptions.
+  BTT_applySpeciesInit(meta, t);
+  BTT_detectAppearanceFromText(meta, t, "INIT", true);
+
+  return false;
+}
+
+/* ----------------------------- CONFIG ---------------------------------- */
+
+var BTT_DEFAULT_CONFIG = {
+  enabled: true,
+
+  context_mode: "excerpt",                 // excerpt|full
+  excerpt_always_include_genitals: true,
+
+  // Reproduction model
+  // Fertility scope controls which *orifice types* are eligible for fertility tracking.
+  fertility_scope_vaginal: true,
+  fertility_scope_anal: false,
+  fertility_scope_oral: false,
+
+  // Appearance prose refresh policy (AI-authored prose written into PLAYER APPEARANCE card)
+  appearance_refresh_enabled: true,
+  appearance_refresh_min_turns: 3,         // minimum turns since last refresh before a new refresh can occur (does NOT block init refresh)
+  appearance_refresh_turns: 6,              // refresh at least every N turns (0 disables turn-based)
+  appearance_refresh_delta: 4.0,            // refresh when cumulative axis delta since last refresh >= this (0 disables delta-based)
+  appearance_refresh_force_init: true,      // force a refresh right after initialization
+
+  // Pronoun policy for appearance prose (hybrid by default)
+  // - hybrid: uses overallFem with a they/them band, and optionally reacts to vagina/penis presence
+  // - fixed: uses current meta.gender baseline only
+  pronoun_policy: "hybrid",
+  pronoun_they_band: 19,                  // [-19..19] => they/them
+  pronoun_switch_on_vagina: true,
+  pronoun_switch_on_penis: true,
+
+
+  retained_turns: 4,
+  decay_base: 0.65,
+
+  // Clause window size (in clauses/sentences) for borrowing nearby slot/trait cues.
+  // Example: "You think you've been transformed." + "It's a tail." should resolve to tail.
+  clause_window: 3,
+  slot_gap_secondary: 0.10,
+
+  // Slot evidence channel weights (dominance scoring)
+  // - Ownership is NOT privileged over mention. It is treated as an ownership marker only.
+  // - Mention is slightly stronger than legacy values to avoid single ownership tokens overriding explicit slot mentions.
+  slotMention: 0.30,
+  slotOwnership: 0.25,
+  slotLocation: 0.14,
+  slotWeak: 0.06,
+
+  debug_seed_cap: 2,
+  debug_window_cap: 3,
+  debug_seed_clip: 140,
+
+  target_min: 0.28,
+  slot_bind_min: 0.45,
+  slot_dominance_gap: 0.18,
+  tail_spine_appendage_bonus: 0.25,
+  tail_from_ass_bonus: 0.35,
+  ass_container_penalty: 0.20,
+
+  threshold_trait_add: 0.90,
+  threshold_trait_remove: 1.10,
+  threshold_offslot_genital_add: 1.40,
+
+  // Descriptor traits (e.g., "sinuous", "wet") are common in prose.
+  // These are frequently used as descriptive flavor and should be harder to commit
+  // than core transformation traits like "parasite".
+  threshold_descriptor_add: 1.20,
+
+  misc_threshold_add: 1.00,
+
+  debug: true,};
+
+function BTT_getTurn(){
+  try{
+    if(typeof state === "undefined" || !state || !state.BTT) return 0;
+    return Number(state.BTT.turnCounter) || 0;
+  }catch(_e){
+    return 0;
+  }
+}
+
+function BTT_hasStoryCards(){
+  return (typeof storyCards !== "undefined" && Array.isArray(storyCards) && typeof addStoryCard === "function");
+}
+function BTT_ensureState(){
+  if(typeof state === "undefined" || !state) state = {};
+  if(!state.BTT) state.BTT = {};
+  if(typeof state.BTT.turnCounter !== "number") state.BTT.turnCounter = 0;
+  if(!state.BTT.evidenceCache) state.BTT.evidenceCache = {};
+  if(!state.BTT.recent) state.BTT.recent = { Player:{} };
+  if(!state.BTT.entities) state.BTT.entities = {};
+}
+function BTT_parseBool(s, fallback){
+  if(typeof s === "boolean") return s;
+  s = String(s||"").trim().toLowerCase();
+  if(["true","t","yes","y","on","1","enable","enabled"].indexOf(s)!==-1) return true;
+  if(["false","f","no","n","off","0","disable","disabled"].indexOf(s)!==-1) return false;
+  return fallback;
+}
+function BTT_parseNum(s, fallback){
+  var n = Number(s);
+  return isFinite(n) ? n : fallback;
+}
+function BTT_round2(n){ return Math.round(n*100)/100; }
+function BTT_fmt2(n){ n=Number(n); if(!isFinite(n)) n=0; return n.toFixed(2); }
+
+function BTT_clip(s, n){
+  s = String(s||"").trim();
+  n = n || 140;
+  if(s.length <= n) return s;
+  return s.slice(0, n-1) + "…";
+}
+
+
+
+/* -------------------- APPEARANCE REFRESH + PRONOUNS --------------------- */
+
+function BTT_getPronouns(cfg, meta){
+  cfg = cfg || BTT_getConfig();
+  meta = meta || BTT_loadEntity('Player');
+
+  var policy = (cfg && cfg.pronoun_policy) ? String(cfg.pronoun_policy).toLowerCase() : 'hybrid';
+  var band = (cfg && typeof cfg.pronoun_they_band === 'number') ? cfg.pronoun_they_band : 19;
+  var fem = Number(meta && meta.overallFem);
+  if(!isFinite(fem)) fem = 0;
+
+  function hasSlot(slot){
+    try{ return !!(meta && meta.slots && meta.slots[slot]); }catch(_e){ return false; }
+  }
+
+  // Default to gender baseline if policy is fixed.
+  if(policy === 'fixed'){
+    var g = String(meta && meta.gender || '').toLowerCase();
+    if(g === 'female') return {subj:'she', obj:'her', posAdj:'her', posPro:'hers', reflex:'herself'};
+    if(g === 'male') return {subj:'he', obj:'him', posAdj:'his', posPro:'his', reflex:'himself'};
+    return {subj:'they', obj:'them', posAdj:'their', posPro:'theirs', reflex:'themself'};
+  }
+
+  // Hybrid (default): banded fem score, with optional genital triggers.
+  var useThey = (fem >= -band && fem <= band);
+  var wantsShe = (fem > band);
+  var wantsHe  = (fem < -band);
+
+  if(cfg && cfg.pronoun_switch_on_vagina && hasSlot('vagina')) wantsShe = true
+
+  if(cfg && cfg.pronoun_switch_on_penis && hasSlot('penis') && !hasSlot('vagina')) wantsHe = true;
+
+  if(useThey) return {subj:'they', obj:'them', posAdj:'their', posPro:'theirs', reflex:'themself'};
+  if(wantsShe && !wantsHe) return {subj:'she', obj:'her', posAdj:'her', posPro:'hers', reflex:'herself'};
+  return {subj:'he', obj:'him', posAdj:'his', posPro:'his', reflex:'himself'};
+}
+
+function BTT_shouldRefreshAppearance(cfg, meta){
+  cfg = cfg || BTT_getConfig();
+  meta = meta || BTT_loadEntity('Player');
+  BTT_appEnsure(meta);
+  meta.appearance = meta.appearance || {};
+
+  if(cfg && cfg.appearance_refresh_enabled === false) return false;
+
+  var now = BTT_getTurn();
+  var last = Number(meta.appearance.lastRefreshTurn);
+  if(!isFinite(last)){
+    try{ if(state && state.BTT && state.BTT.appearanceGen && isFinite(Number(state.BTT.appearanceGen.lastRefreshTurn))) last = Number(state.BTT.appearanceGen.lastRefreshTurn); }catch(_e){}
+  }
+  if(!isFinite(last)) last = -999;
+
+  // Force a refresh immediately after initialization (so the card becomes AI-authored ASAP).
+  // IMPORTANT: This must bypass the spacing guard AND must not loop forever.
+  if(cfg && cfg.appearance_refresh_force_init && meta.__initialized && state && state.BTT && state.BTT.appearanceGen && state.BTT.appearanceGen.didInit !== true){
+    return true;
+  }
+
+  // Minimum-turn guard (prevents spammy appearance refresh generation).
+  // This is measured in turns SINCE LAST REFRESH (not since story start).
+  var minTurns = (cfg && typeof cfg.appearance_refresh_min_turns === 'number') ? cfg.appearance_refresh_min_turns : 3;
+  if(!isFinite(minTurns) || minTurns < 0) minTurns = 0;
+  // If we have a prior refresh turn, enforce minimum spacing between refreshes.
+  if(minTurns > 0 && isFinite(last) && last > -900 && (now - last) < minTurns) return false;
+
+  // Turn cadence
+  var every = (cfg && typeof cfg.appearance_refresh_turns === 'number') ? cfg.appearance_refresh_turns : 6;
+  if(every > 0 && (now - last) >= every) return true;
+
+  // Change magnitude cadence (cumulative axis delta since last refresh)
+  var dth = (cfg && typeof cfg.appearance_refresh_delta === 'number') ? cfg.appearance_refresh_delta : 4.0;
+  var dsum = Number(meta.appearance._delta_since_refresh)||0;
+  if(!isFinite(dsum) || dsum<0){
+    try{ if(state && state.BTT && state.BTT.appearanceGen && isFinite(Number(state.BTT.appearanceGen.deltaSinceRefresh))) dsum = Number(state.BTT.appearanceGen.deltaSinceRefresh)||0; }catch(_e2){}
+  }
+  if(dth > 0 && dsum >= dth) return true;
+
+  return false;
+}
+
+function BTT_buildAppearanceRefreshInstruction(cfg, meta){
+  cfg = cfg || BTT_getConfig();
+  meta = meta || BTT_loadEntity('Player');
+  meta.appearance = meta.appearance || {};
+
+  var p = BTT_getPronouns(cfg, meta);
+  var subj = String(p.subj || 'they');
+  var subjCap = subj.charAt(0).toUpperCase() + subj.slice(1);
+
+  // Build an anatomy sketch for the model to rewrite into prose.
+  var parts = [];
+  try{
+    var slots = meta.slots || {};
+    var order = ['head','arms','legs','breasts','gut','penis','vagina','ass','tail','wings'];
+    for(var i=0;i<order.length;i++){
+      var s = order[i];
+      if(!slots[s]) continue;
+      var t = (slots[s].traits||[]).slice(0);
+      // Keep prompt compact: remove mechanical traits
+      t = t.filter(function(x){
+        x = String(x||'').toLowerCase();
+        return !(x.indexOf('fertility')===0 || x.indexOf('virility')===0);
+      });
+      parts.push(s + ': ' + (t.length ? t.join(', ') : 'none'));
+    }
+  }catch(_e){}
+
+  var fem = Number(meta.overallFem) || 0;
+  var species = String(meta.species || 'human');
+  var seed = (meta.appearance && meta.appearance.seed) ? String(meta.appearance.seed) : '';
+
+  // IMPORTANT:
+  // The model must append a tagged block to the END of its response.
+  // We keep the instruction compact and avoid contradictory “only return” language.
+  var lines = [];
+  lines.push('BTT SYSTEM (hidden): At the END of your response, append an AI-only appearance block using the exact tags shown below.');
+  lines.push('The block must describe the Player character ONLY (nude appearance), 3-4 sentences, no actions, no dialogue, no second-person address.');
+  lines.push('Use pronouns: ' + subjCap + '/' + String(p.obj||'them') + '.');
+  lines.push('Include face/hair/eyes/scent if known; mention major anatomy and overall silhouette.');
+  lines.push('Do NOT include anything except prose between the tags.');
+  lines.push('--- Known facts (do not contradict) ---');
+  lines.push('Species: ' + species);
+  lines.push('OverallFem: ' + fem);
+  try{
+    BTT_appEnsure(meta);
+    var ax = meta.appearance.axes || {};
+    lines.push('Axes: fem ' + (Number(ax.fem)||0) + ', fertility ' + (Number(ax.fertility)||0) + ', virility ' + (Number(ax.virility)||0));
+    lines.push('Sizes: breasts ' + (Number(ax.breast_size)||0) + ', ass ' + (Number(ax.ass_size)||0) + ', cock ' + (Number(ax.cock_size)||0));
+  }catch(_axE){}
+  if(seed) lines.push('Seed: ' + seed);
+  // Appearance fields captured by BTT (ownership-gated). Provide these as hard facts when present.
+  try{
+    var f = (meta.appearance && meta.appearance.fields) ? meta.appearance.fields : {};
+    if(f.skin) lines.push('Known skin: ' + f.skin);
+    if(f.hair) lines.push('Known hair: ' + f.hair);
+    if(f.eyes) lines.push('Known eyes: ' + f.eyes);
+    if(f.build) lines.push('Known build: ' + f.build);
+    if(f.scent) lines.push('Known scent: ' + f.scent);
+    if(f.cup) lines.push('Breast size impression: ' + f.cup);
+    if(f.ass) lines.push('Ass size impression: ' + f.ass);
+    if(f.cock) lines.push('Cock size impression: ' + f.cock);
+  }catch(_e2){}
+
+  if(parts.length){
+    lines.push('Anatomy sketch:');
+    for(var j=0;j<parts.length;j++) lines.push(parts[j]);
+  }
+  lines.push('--- Append exactly ---');
+  lines.push('<<BTT_APPEARANCE_REFRESH>>');
+  lines.push('<3-4 sentences of appearance prose>');
+  lines.push('<<END_BTT_APPEARANCE_REFRESH>>');
+
+  return '\n' + lines.join('\n') + '\n';
+}
+
+/* ----------------------------------------------------------------------------
+   APPEARANCE PROSE — AC/IS-STYLE GENERATION MODE
+   ----------------------------------------------------------------------------
+   Rationale:
+   - InnerSelf/AutoCards can rewrite/replace context. A simple "prefix + tags"
+     approach is brittle under multi-script pipelines.
+   - When AC/IS are present, we intentionally "spend" a turn to generate ONLY
+     the appearance paragraph, capture it on output, write it to the
+     PLAYER APPEARANCE (BTT) story card, then suppress the maintenance text.
+   - This mirrors Auto-Cards' technique: "Stop the story and ignore previous
+     instructions. Write only X..." and then capture the output.
+   ---------------------------------------------------------------------------- */
+
+function BTT_buildAppearanceGenerationPrompt(cfg, meta, styleText){
+  // HARD contract prompt used in dedicated refresh turns.
+  // This MUST survive context truncation, so keep it compact and place it LAST.
+  cfg = cfg || BTT_getConfig();
+  meta = meta || BTT_loadEntity("Player");
+
+  var snap = BTT_buildAppearanceStateSnapshot(meta);
+
+  // Style reference is optional and SHORT; never factual unless also in snapshot.
+  var st = String(styleText||"").replace(/\s+/g," ").trim();
+  if(st.length > 360) st = st.slice(st.length - 360);
+
+  var lines = [];
+  lines.push("-----");
+  lines.push("SYSTEM (BTT) — HARD OUTPUT CONTRACT");
+  lines.push("You MUST output ONLY one tagged block and NOTHING ELSE.");
+  lines.push("Do NOT write story text. Do NOT continue the scene. Do NOT write dialogue or actions.");
+  lines.push("If you output anything outside the tags, the output is INVALID.");
+  lines.push("");
+  lines.push("REQUIRED FORMAT (copy tags exactly):");
+  lines.push("<<BTT_APPEARANCE_REFRESH>>");
+  lines.push("<ONE concise paragraph, 1–4 sentences, describing ONLY the player's CURRENT PHYSICAL APPEARANCE>");
+  lines.push("<<END_BTT_APPEARANCE_REFRESH>>");
+  lines.push("");
+  lines.push("FACTS (source of truth):");
+  lines.push(snap);
+  if(st){
+    lines.push("");
+    lines.push("STYLE ONLY (optional; not factual unless also in FACTS):");
+    lines.push(st);
+  }
+  lines.push("");
+  lines.push("OUTPUT THE TAGGED BLOCK NOW:");
+
+  return lines.join("\n");
+}
+
+
+
+
+// Extract and strip the AI-generated appearance refresh block from visible output.
+// The AI is instructed (in onContext) to append the block at the end of its response.
+// We capture it, store it to the story card, and remove it from the returned output
+// so the player never sees the refresh prose.
+function BTT_extractAppearanceRefresh(rawText){
+  var t = String(rawText||"");
+  var startTag = "<<BTT_APPEARANCE_REFRESH>>";
+  var endTag   = "<<END_BTT_APPEARANCE_REFRESH>>";
+  var si = t.indexOf(startTag);
+  if(si < 0) return { cleaned: t, prose: "" };
+  var ei = t.indexOf(endTag, si + startTag.length);
+  if(ei < 0) return { cleaned: t, prose: "" };
+  var prose = t.slice(si + startTag.length, ei).trim();
+  var cleaned = (t.slice(0, si) + t.slice(ei + endTag.length)).replace(/\n{3,}/g, "\n\n").trim();
+  return { cleaned: cleaned, prose: prose };
+}
+
+
+function BTT_stripTaggedBlock(text, startTag, endTag){
+  text = String(text||'');
+  startTag = String(startTag||'');
+  endTag = String(endTag||'');
+  var s = text.indexOf(startTag);
+  if(s === -1) return { clean:text, extracted:'' };
+  var e = text.indexOf(endTag, s + startTag.length);
+  if(e === -1) return { clean:text, extracted:'' };
+  var extracted = text.slice(s + startTag.length, e).trim();
+  var clean = (text.slice(0, s) + text.slice(e + endTag.length)).trim();
+  return { clean: clean, extracted: extracted };
+}
+
+/* ============================================================================
+   BTT_APPEARANCE_CORE (decoupled axes)
+   ---------------------------------------------------------------------------
+   Purpose
+   - Fully divorced from slot/trait commit logic.
+   - Stores lightweight scalar axes + minimal evidence.
+   - Axis semantics:
+       0-40  : normal human range
+       20    : average human
+       41-60 : rare/extreme human
+       61-100: increasingly hyper/magical
+
+   Axes (stored under meta.appearance.axes)
+   - fem         : -100..100 (mirrors meta.overallFem)
+   - fertility   : 0..100
+   - virility    : 0..100
+   - breast_size : 0..100
+   - ass_size    : 0..100
+   - cock_size   : 0..100
+
+   Notes
+   - Hard evidence sets an axis outright.
+   - Soft evidence applies deltas and is then clamped.
+   - AI prose is generated from the appearance array, captured via tagged output.
+============================================================================ */
+
+var BTT_APP = {
+  evidence_cap: 20,
+
+  // Cup mapping: DD == E. Extended beyond M.
+  // Values are calibrated so C-D is average (20) and L-M sit in extreme human band.
+  cupToAxis: {
+    'AA':3, 'A':5, 'B':10, 'C':18, 'D':22,
+    'DD':24, 'E':24,
+    'F':28, 'G':32, 'H':38,
+    'I':43, 'J':48, 'K':53,
+    'L':56, 'M':60,
+    'N':63, 'O':68, 'P':73, 'Q':78, 'R':83,
+    'S':88, 'T':93, 'U':98
+  }
+};
+
+function BTT_appClamp01(x){
+  x = Number(x);
+  if(!isFinite(x)) return 0;
+  return Math.max(0, Math.min(100, x));
+}
+
+
+
+// Pretty display helpers
+function BTT_appPrettyBreastAxis(axis){
+  axis = BTT_appClamp01(axis);
+  if(axis < 1) return "none";
+  return String(axis);
+}
+function BTT_appEnsure(meta){
+  if(!meta) return;
+  if(!meta.appearance) meta.appearance = { summary:'', summary_ai:'', fields:{}, evidence:[] };
+  if(!meta.appearance.fields) meta.appearance.fields = {};
+  if(!Array.isArray(meta.appearance.evidence)) meta.appearance.evidence = [];
+  if(!meta.appearance.axes) meta.appearance.axes = {};
+
+  var ax = meta.appearance.axes;
+  if(typeof ax.fem !== 'number') ax.fem = (typeof meta.overallFem==='number') ? meta.overallFem : 0;
+  if(typeof ax.fertility !== 'number') ax.fertility = 0;
+  if(typeof ax.virility !== 'number') ax.virility = 0;
+  if(typeof ax.breast_size !== 'number') ax.breast_size = 0;
+  if(typeof ax.ass_size !== 'number') ax.ass_size = 0;
+  if(typeof ax.cock_size !== 'number') ax.cock_size = 0;
+
+  // Refresh bookkeeping
+  if(typeof meta.appearance._delta_since_refresh !== 'number') meta.appearance._delta_since_refresh = 0;
+  if(typeof meta.appearance._turns_since_refresh !== 'number') meta.appearance._turns_since_refresh = 0;
+  if(typeof meta.appearance._last_refresh_turn !== 'number') meta.appearance._last_refresh_turn = -1;
+  if(!meta.appearance.canon) meta.appearance.canon = {};
+}
+
+function BTT_appPushEvidence(meta, axis, delta, reason, src){
+  try{
+    BTT_appEnsure(meta);
+    var ev = meta.appearance.evidence;
+    ev.push({ axis:String(axis||''), delta:Number(delta)||0, reason:String(reason||''), src:String(src||'') });
+    if(ev.length > BTT_APP.evidence_cap) ev.splice(0, ev.length - BTT_APP.evidence_cap);
+  }catch(_e){}
+}
+
+function BTT_appSet(meta, axis, value, reason, src){
+  BTT_appEnsure(meta);
+  var ax = meta.appearance.axes;
+  var oldv = (axis==='fem') ? (Number(ax.fem)||0) : (Number(ax[axis])||0);
+  if(axis === 'fem'){
+    ax.fem = Math.max(-100, Math.min(100, Number(value)||0));
+    meta.overallFem = ax.fem;
+  }else{
+    ax[axis] = BTT_appClamp01(value);
+  }
+  BTT_appPushEvidence(meta, axis, 0, 'SET: ' + String(reason||''), src||'');
+  var newv = (axis==='fem') ? (Number(ax.fem)||0) : (Number(ax[axis])||0);
+  meta.appearance._delta_since_refresh = (Number(meta.appearance._delta_since_refresh)||0) + Math.abs(newv - oldv);
+  try{ if(state && state.BTT && state.BTT.appearanceGen) state.BTT.appearanceGen.deltaSinceRefresh = Number(meta.appearance._delta_since_refresh)||0; }catch(_eD){}
+
+  // Track last-pass axis deltas for UI/debug display.
+  meta.appearance._last_axis_deltas = meta.appearance._last_axis_deltas || {};
+  meta.appearance._last_axis_deltas[axis] = (Number(meta.appearance._last_axis_deltas[axis])||0) + (newv - oldv);
+  meta.appearance._last_axis_delta_turn = BTT_getTurn();
+
+}
+
+function BTT_appAdd(meta, axis, delta, reason, src){
+  BTT_appEnsure(meta);
+  var ax = meta.appearance.axes;
+  var oldv = (axis==='fem') ? (Number(ax.fem)||0) : (Number(ax[axis])||0);
+  if(axis === 'fem'){
+    var v = Math.max(-100, Math.min(100, (Number(ax.fem)||0) + (Number(delta)||0)));
+    ax.fem = v;
+    meta.overallFem = v;
+  }else{
+    ax[axis] = BTT_appClamp01((Number(ax[axis])||0) + (Number(delta)||0));
+  }
+  BTT_appPushEvidence(meta, axis, Number(delta)||0, reason||'', src||'');
+  // Track cumulative change magnitude since last appearance prose refresh.
+  var newv = (axis==='fem') ? (Number(ax.fem)||0) : (Number(ax[axis])||0);
+  meta.appearance._delta_since_refresh = (Number(meta.appearance._delta_since_refresh)||0) + Math.abs(newv - oldv);
+  try{ if(state && state.BTT && state.BTT.appearanceGen) state.BTT.appearanceGen.deltaSinceRefresh = Number(meta.appearance._delta_since_refresh)||0; }catch(_eD){}
+
+  // Track last-pass axis deltas for UI/debug display.
+  meta.appearance._last_axis_deltas = meta.appearance._last_axis_deltas || {};
+  meta.appearance._last_axis_deltas[axis] = (Number(meta.appearance._last_axis_deltas[axis])||0) + (newv - oldv);
+  meta.appearance._last_axis_delta_turn = BTT_getTurn();
+
+}
+
+function BTT_appBaseline(meta){
+  BTT_appEnsure(meta);
+  var g = String(meta.gender||'').toLowerCase();
+  var ax = meta.appearance.axes;
+
+  // Fem baseline mirrors existing gender baseline.
+  ax.fem = (typeof meta.overallFem==='number') ? meta.overallFem : 0;
+
+  if(g === 'male'){
+    if(ax.cock_size === 0) ax.cock_size = 20;
+    if(ax.ass_size === 0) ax.ass_size = 13;
+    if(ax.breast_size === 0) ax.breast_size = 0;
+    if(ax.virility === 0) ax.virility = 20;
+    if(ax.fertility === 0) ax.fertility = 0;
+  }else if(g === 'female'){
+    if(ax.cock_size === 0) ax.cock_size = 0;
+    if(ax.ass_size === 0) ax.ass_size = 20;
+    if(ax.breast_size === 0) ax.breast_size = 20;
+    if(ax.virility === 0) ax.virility = 0;
+    if(ax.fertility === 0) ax.fertility = 20;
+  }else{
+    // herm/futa/femboy/etc: conservative neutral baseline
+    if(ax.ass_size === 0) ax.ass_size = 17;
+    if(ax.breast_size === 0) ax.breast_size = (g==='femboy') ? 5 : 10;
+    if(ax.cock_size === 0) ax.cock_size = (g==='futanari') ? 20 : 10;
+    if(ax.virility === 0) ax.virility = (ax.cock_size>0) ? 20 : 10;
+    if(ax.fertility === 0) ax.fertility = (ax.breast_size>0) ? 20 : 10;
+  }
+
+  // Clamp.
+  ax.cock_size = BTT_appClamp01(ax.cock_size);
+  ax.ass_size = BTT_appClamp01(ax.ass_size);
+  ax.breast_size = BTT_appClamp01(ax.breast_size);
+  ax.virility = BTT_appClamp01(ax.virility);
+  ax.fertility = BTT_appClamp01(ax.fertility);
+  ax.fem = Math.max(-100, Math.min(100, Number(ax.fem)||0));
+  meta.overallFem = ax.fem;
+}
+
+function BTT_appExtractSeedFromText(text){
+  // Goal: capture the earliest player-owned appearance prose.
+  // Minimal heuristic: take first 1-2 sentences containing "you are" or "your".
+  var t = String(text||'').replace(/\s+/g,' ').trim();
+  if(!t) return '';
+  var parts = t.split(/(?<=[.!?])\s+/g);
+  var out = [];
+  for(var i=0;i<parts.length && out.length<2;i++){
+    var s = String(parts[i]||'').trim();
+    if(!s) continue;
+    var sl = s.toLowerCase();
+    if(sl.indexOf('you are')!==-1 || sl.indexOf('your ')!==-1){
+      out.push(s)
+    }
+  }
+  if(!out.length) return '';
+  return out.join(' ').trim();
+
+}
+
+
+function BTT_appParseCupAxis(textLower){
+  // Returns axis value or null
+  var t = String(textLower||'');
+  // DD/E special
+  if(/\b(dd|d\s*d|double\s*d|e)\s*-?\s*cup\b/.test(t)) return BTT_APP.cupToAxis['DD'];
+  // Letter cups A-U
+  var m = t.match(/\b([a-u])\s*-?\s*cup\b/);
+  if(!m) m = t.match(/\bcup\s*size\s*[:=]?\s*([a-u])\b/);
+  if(!m) return null;
+  var letter = String(m[1]||'').toUpperCase();
+  return (letter in BTT_APP.cupToAxis) ? BTT_APP.cupToAxis[letter] : null;
+}
+
+function BTT_appParseInchLengthAxis(textLower){
+  // Detect penis length in inches and map: axis = 20 + (len-5)*5
+  // Only triggers when local context implies penis/cock or erection.
+  var t = String(textLower||'');
+  var re = /(\d+(?:\.\d+)?)\s*(?:inches|inch|\")/g;
+  var m;
+  while((m = re.exec(t))){
+    var val = Number(m[1]);
+    if(!isFinite(val)) continue;
+    var start = max(0, m.index-40);
+    var end = min(t.length, m.index+40);
+    var ctx = t.slice(start,end);
+    if(/\b(cock|dick|penis|shaft|erect|hard|stiff)\b/.test(ctx)){
+      var axis = 20 + ((val - 5) * 5);
+      return BTT_appClamp01(axis);
+    }
+  }
+  return null;
+
+  function max(a,b){ return a>b?a:b; }
+  function min(a,b){ return a<b?a:b; }
+}
+
+/* -------------------- CANONICAL SIZE BUCKETS (AXES -> SINGLE TAG) --------------------
+   Purpose:
+   - Convert continuous axes (0..100) into ONE canonical bucket/tag at a time.
+   - Avoid stacking ("cup-f" + "cup-g" + ...) by always REPLACING the prior tag.
+   - Each canonical entry in the approved tables is a semantic step.
+   Notes:
+   - These tags are meant for INTERNAL consistency / optional slot annotation.
+   - The AI should describe sizes from the numeric axes + canonical references, not from adjectives here.
+------------------------------------------------------------------------------------- */
+
+function BTT_appBuildCupBoundaries(){
+  // Build dynamic mid-point boundaries between cup axis anchors.
+  if(BTT_APP._cupBounds) return BTT_APP._cupBounds;
+  var items = [];
+  for(var k in BTT_APP.cupToAxis){
+    if(!BTT_APP.cupToAxis.hasOwnProperty(k)) continue;
+    items.push({ cup:String(k), v:Number(BTT_APP.cupToAxis[k]) });
+  }
+  items.sort(function(a,b){ return a.v-b.v; });
+
+  // Collapse duplicate anchors (DD/E share the same value): keep DD as canonical.
+  var filtered = [];
+  for(var i=0;i<items.length;i++){
+    var it = items[i];
+    if(it.cup === "E") continue;
+    filtered.push(it);
+  }
+  items = filtered;
+
+  var bounds = [];
+  for(var j=0;j<items.length;j++){
+    var cur = items[j];
+    var prev = (j>0) ? items[j-1] : null;
+    var next = (j<items.length-1) ? items[j+1] : null;
+    var lo = prev ? (prev.v + cur.v)/2 : -Infinity;
+    var hi = next ? (cur.v + next.v)/2 : Infinity;
+    bounds.push({ cup:cur.cup, v:cur.v, lo:lo, hi:hi });
+  }
+  BTT_APP._cupBounds = bounds;
+  return bounds;
+}
+
+function BTT_appAxisToCup(axis){
+  axis = Number(axis);
+  if(!isFinite(axis)) axis = 0;
+  // 0 => "none" (no cup)
+  if(axis < 1) return null;
+  var bounds = BTT_appBuildCupBoundaries();
+  for(var i=0;i<bounds.length;i++){
+    var b = bounds[i];
+    if(axis >= b.lo && axis < b.hi) return b.cup;
+  }
+  return "C";
+}
+
+function BTT_appCupTag(cup){
+  cup = String(cup||"").trim().toUpperCase();
+  if(cup === "E") cup = "DD";
+  if(!cup) return null;
+  return "cup-" + cup.toLowerCase();
+}
+
+// Cock axis rule: 1 inch per 5 points past 20 (20 -> 5").
+// Below 20: subtract 1 inch per 5 points (clamped at 0).
+function BTT_appCockAxisToInches(axis){
+  axis = Number(axis);
+  if(!isFinite(axis)) axis = 0;
+  var inches = 5 + ((axis - 20) / 5.0);
+  if(inches < 0) inches = 0;
+  return inches;
+}
+
+function BTT_appInchesToCockTag(inches){
+  inches = Number(inches);
+  if(!isFinite(inches)) inches = 0;
+  // Canonical semantic steps: integer inches.
+  var bucket = Math.max(0, Math.round(inches));
+  return "cock-" + bucket + "in";
+}
+
+function BTT_appAxisToAssTag(axis){
+  axis = Number(axis);
+  if(!isFinite(axis)) axis = 0;
+  // Frame-relative tiers (semantic steps). 0-40 is human band, >40 hyper.
+  if(axis < 8) return "ass-flat";
+  if(axis < 13) return "ass-small";
+  if(axis < 21) return "ass-average";
+  if(axis < 28) return "ass-curvy";
+  if(axis < 34) return "ass-big";
+  if(axis < 40) return "ass-huge";
+  if(axis < 55) return "ass-massive";
+  return "ass-hyper";
+}
+
+function BTT_replaceTraitPrefix(slotObj, prefix, newTrait){
+  if(!slotObj || !Array.isArray(slotObj.traits)) return;
+  var out = [];
+  var seen = {};
+  prefix = String(prefix||"").toLowerCase();
+  for(var i=0;i<slotObj.traits.length;i++){
+    var t = String(slotObj.traits[i]||"").trim();
+    if(!t) continue;
+    var tl = t.toLowerCase();
+    if(prefix && tl.indexOf(prefix)===0) continue;
+    if(seen[tl]) continue;
+    seen[tl]=true;
+    out.push(t);
+  }
+  if(newTrait){
+    var nt = String(newTrait).trim();
+    var ntl = nt.toLowerCase();
+    if(nt && !seen[ntl]){
+      out.push(nt);
+    }
+  }
+  slotObj.traits = out;
+}
+
+function BTT_appApplyCanonicalSizeTraits(meta){
+  if(!meta || !meta.slots) return;
+  BTT_appEnsure(meta);
+  var ax = meta.appearance.axes || {};
+  meta.appearance.canon = meta.appearance.canon || {};
+
+  // Breasts: cup tag
+  var cup = BTT_appAxisToCup(ax.breast_size);
+  meta.appearance.canon.breast_cup = cup;
+  if(meta.slots.breasts){
+    BTT_replaceTraitPrefix(meta.slots.breasts, "cup-", BTT_appCupTag(cup));
+  }
+
+  // Penis: cock inches tag
+  var inches = BTT_appCockAxisToInches(ax.cock_size);
+  meta.appearance.canon.cock_inches = inches;
+  if(meta.slots.penis){
+    BTT_replaceTraitPrefix(meta.slots.penis, "cock-", BTT_appInchesToCockTag(inches));
+  }
+
+  // Ass: tier tag
+  var asstag = BTT_appAxisToAssTag(ax.ass_size);
+  meta.appearance.canon.ass_tier = asstag;
+  if(meta.slots.ass){
+    // ass-* tiers occupy one slot
+    BTT_replaceTraitPrefix(meta.slots.ass, "ass-", asstag);
+  }
+}
+
+function BTT_appParseExplicitAxis(textLower, key){
+  // key like 'virility' or 'fertility' or 'cock size'
+  var t = String(textLower||'');
+  var r = new RegExp('\\b' + BTT_escapeRegExp(key) + '\\s*(?:[:=]|\\s)\\s*(\\d{1,3})\\b');
+  var m = t.match(r);
+  if(!m) return null;
+  var v = Number(m[1]);
+  if(!isFinite(v)) return null;
+  return BTT_appClamp01(v);
+}
+
+function BTT_appApplyFromText(meta, text, src, isInit){
+  BTT_appEnsure(meta);
+
+  // Reset per-pass axis delta accumulator (for UI/debug display).
+  meta.appearance._last_axis_deltas = {};
+  meta.appearance._last_axis_delta_turn = BTT_getTurn();
+  var t = String(text||'');
+  var tl = t.toLowerCase();
+
+  if(isInit){
+    BTT_appBaseline(meta);
+    // Seed prose from initial prompt output (player-authored) when available.
+    // NOTE (policy): the PLAYER APPEARANCE (BTT) card is intended to be AI-authored.
+    // We still store a seed for debugging, but we do NOT treat it as AI output.
+    meta.appearance.seed = meta.appearance.seed || BTT_appExtractSeedFromText(t);
+
+    // If we have not yet captured an AI-authored appearance paragraph, force an explicit placeholder
+    // so pipeline failures are visible (and do not silently fall back to script prose).
+    if(!meta.appearance.summary_ai || !String(meta.appearance.summary_ai).trim()){
+      meta.appearance.summary_ai = "Initialized, No AI description";
+      meta.appearance._did_ai_init = false;
+    }
+  }
+
+  // Hard numeric setters
+  var v;
+  v = BTT_appParseExplicitAxis(tl, 'virility');
+  if(v !== null) BTT_appSet(meta, 'virility', v, 'explicit virility', src);
+  v = BTT_appParseExplicitAxis(tl, 'fertility');
+  if(v !== null) BTT_appSet(meta, 'fertility', v, 'explicit fertility', src);
+  v = BTT_appParseExplicitAxis(tl, 'cock size');
+  if(v !== null) BTT_appSet(meta, 'cock_size', v, 'explicit cock size', src);
+  v = BTT_appParseExplicitAxis(tl, 'ass size');
+  if(v !== null) BTT_appSet(meta, 'ass_size', v, 'explicit ass size', src);
+  v = BTT_appParseExplicitAxis(tl, 'breast size');
+  if(v !== null) BTT_appSet(meta, 'breast_size', v, 'explicit breast size', src);
+
+  // Cup size (hard)
+  v = BTT_appParseCupAxis(tl);
+  if(v !== null) BTT_appSet(meta, 'breast_size', v, 'cup size', src);
+
+  // Penis length inches (hard)
+  v = BTT_appParseInchLengthAxis(tl);
+  if(v !== null) BTT_appSet(meta, 'cock_size', v, 'inch length', src);
+
+  // Soft descriptive deltas (minimal starter set; can be expanded later)
+  if(/\b(flat\s+chest|no\s+breasts?)\b/.test(tl)) BTT_appSet(meta, 'breast_size', 0, 'flat chest', src);
+  if(/\b(budding\s+breasts?|small\s+breasts?)\b/.test(tl)) BTT_appAdd(meta, 'breast_size', 3, 'small breasts', src);
+  if(/\b(large\s+breasts?|big\s+boobs?|huge\s+tits?)\b/.test(tl)) BTT_appAdd(meta, 'breast_size', 8, 'large breasts', src);
+
+  if(/\b(flat\s+ass|flat\s+butt)\b/.test(tl)) BTT_appAdd(meta, 'ass_size', -4, 'flat ass', src);
+  if(/\b(thick\s+ass|thick\s+butt|bubble\s+butt)\b/.test(tl)) BTT_appAdd(meta, 'ass_size', 5, 'thick ass', src);
+  if(/\b(huge\s+ass|massive\s+ass)\b/.test(tl)) BTT_appAdd(meta, 'ass_size', 10, 'huge ass', src);
+
+  if(/\b(shrinking\s+cock|cock\s+shrinks|penis\s+shrinks)\b/.test(tl)) BTT_appAdd(meta, 'cock_size', -6, 'shrinking cock', src);
+  if(/\b(growing\s+cock|cock\s+grows|penis\s+grows)\b/.test(tl)) BTT_appAdd(meta, 'cock_size', 6, 'growing cock', src);
+
+  if(/\b(hyper\s*f(?:ertile|ertility))\b/.test(tl)) BTT_appSet(meta, 'fertility', 70, 'hyper-fertile', src);
+  if(/\b(hyper\s*v(?:irile|irility))\b/.test(tl)) BTT_appSet(meta, 'virility', 70, 'hyper-virile', src);
+  if(/\b(impotent)\b/.test(tl)) BTT_appSet(meta, 'virility', 0, 'impotent', src);
+  if(/\b(infertile|sterile)\b/.test(tl)) BTT_appSet(meta, 'fertility', 0, 'infertile', src);
+
+  // Feminity cues remain primarily controlled by slot system, but we can apply small nudges.
+  if(/\b(ruggedly\s+masculine|very\s+masculine|manly)\b/.test(tl)) BTT_appAdd(meta, 'fem', -5, 'masculine cue', src);
+  if(/\b(very\s+feminine|lush|curvaceous|built\s+for\s+breeding)\b/.test(tl)) BTT_appAdd(meta, 'fem', 5, 'feminine cue', src);
+
+  // Keep fem mirror
+  meta.appearance.axes.fem = Math.max(-100, Math.min(100, Number(meta.overallFem)||0));
+}
+
+function BTT_escapeRegExp(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
+
+function BTT_getConfig(){
+  var cfg = {};
+  for(var k in BTT_DEFAULT_CONFIG) cfg[k] = BTT_DEFAULT_CONFIG[k];
+  if(!BTT_hasStoryCards()) return cfg;
+
+  var title = "Configure BTT";
+  var sc = storyCards.find(function(c){ return c.title === title; });
+  if(!sc){
+    addStoryCard(title, "btt, config", "Config");
+    sc = storyCards.find(function(c){ return c.title === title; });
+    if(sc){
+      sc.entry = [
+        "Configure BTT",
+        "",
+        "enabled: true",
+        "context_mode: excerpt",
+        "excerpt_always_include_genitals: true",
+        "",
+        "retained_turns: 4",
+        "decay_base: 0.65",
+        "clause_window: 3",
+        "",
+        "target_min: 0.28",
+        "tail_spine_appendage_bonus: 0.25",
+        "",
+        "threshold_trait_add: 0.90",
+        "threshold_trait_remove: 1.10",
+        "threshold_offslot_genital_add: 1.40",
+        "misc_threshold_add: 1.00",
+        "",
+        "appearance_refresh_enabled: true",
+        "appearance_refresh_turns: 6",
+        "appearance_refresh_min_turns: 3",
+        "appearance_refresh_delta: 4.0",
+        "appearance_refresh_force_init: true",
+        "",
+        "debug: true"
+      ].join("\n");      sc.description = "";
+    }
+  }
+
+  if(sc && typeof sc.entry === "string"){
+    sc.entry.split("\n").forEach(function(line){
+      var hash = line.indexOf("#");
+      if(hash !== -1) line = line.slice(0, hash);
+      if(line.indexOf(":") === -1) return;
+      var parts = line.split(":");
+      var key = parts.shift().trim();
+      var val = parts.join(":").trim();
+      if(!key || !(key in cfg)) return;
+      if(typeof cfg[key] === "boolean") cfg[key] = BTT_parseBool(val, cfg[key]);
+      else if(typeof cfg[key] === "number") cfg[key] = BTT_parseNum(val, cfg[key]);
+      else cfg[key] = val;
+    });
+  }
+
+  cfg.context_mode = (cfg.context_mode === "full") ? "full" : "excerpt";
+  cfg.retained_turns = Math.max(0, Math.min(50, Number(cfg.retained_turns)||4));
+  cfg.decay_base = Math.max(0.0, Math.min(0.999, Number(cfg.decay_base)||0.65));
+  cfg.clause_window = Math.max(1, Math.min(6, Number(cfg.clause_window)||3));
+  cfg.target_min = Math.max(0, Math.min(5, Number(cfg.target_min)||0.28));
+  cfg.tail_spine_appendage_bonus = Math.max(0, Math.min(2, Number(cfg.tail_spine_appendage_bonus)||0.25));
+  cfg.debug_max_lines = Math.max(0, Math.min(80, Number(cfg.debug_max_lines)||24));
+  cfg.debug_reason_cap = Math.max(0, Math.min(30, Number(cfg.debug_reason_cap)||8));
+  cfg.debug_clause_cap = Math.max(0, Math.min(20, Number(cfg.debug_clause_cap)||2));
+  cfg.debug_keep_lines = Math.max(0, Math.min(200, Number(cfg.debug_keep_lines)||60));
+  cfg.misc_threshold_add = Math.max(0.5, Math.min(5, Number(cfg.misc_threshold_add)||1.8));
+
+  // Back-compat: map older appearance refresh keys if present
+  if(typeof cfg.appearance_refresh_turns !== 'number'){
+    if(typeof cfg.appearance_refresh_every === 'number') cfg.appearance_refresh_turns = cfg.appearance_refresh_every;
+  }
+  if(typeof cfg.appearance_refresh_force_init !== 'boolean'){
+    if(typeof cfg.appearance_refresh_force_on_init === 'boolean') cfg.appearance_refresh_force_init = cfg.appearance_refresh_force_on_init;
+  }
+  if(typeof cfg.appearance_refresh_enabled !== 'boolean'){
+    // If any of the cadence options are set, consider it enabled.
+    cfg.appearance_refresh_enabled = true;
+  }
+  if(typeof cfg.appearance_refresh_delta !== 'number'){
+    // Old fem delta no longer used; default to 4.
+    cfg.appearance_refresh_delta = 4.0;
+  }
+
+  if(typeof cfg.appearance_refresh_min_turns !== 'number'){
+    cfg.appearance_refresh_min_turns = 3;
+  }
+  // Clamp appearance refresh controls
+  cfg.appearance_refresh_turns = Math.max(0, Math.min(50, Number(cfg.appearance_refresh_turns)||6));
+  cfg.appearance_refresh_min_turns = Math.max(0, Math.min(50, Number(cfg.appearance_refresh_min_turns)||3));
+  cfg.appearance_refresh_delta = Math.max(0, Math.min(50, Number(cfg.appearance_refresh_delta)||4.0));
+
+  return cfg;
+}
+
+/* ----------------------- STORY CARD MODEL ------------------------------- */
+
+function BTT_entityTitle(entity){
+  if(entity === "Player") return "BTT | Player";
+  if(entity && entity.indexOf("NPC:")===0) return "BTT | NPC | " + entity.slice(4);
+  return "BTT | " + entity;
+}
+
+function BTT_buildDefaultMeta(entity){
+  return {
+    entity: entity,
+    __initialized: false,
+    gender: "hermaphrodite",
+    genderConf: 0,
+    species: "human",
+    speciesConf: 0,
+    speciesLocked: false,
+    overallFem: 0,
+    appearance: { summary: "", summary_ai: "", seed: "", fields: {}, evidence: [], axes: {} },
+    slots: {}, // no prefilling
+    debugLog: [] // REQUIRED: BTT_tryInit pushes here
+  };
+}
+
+function BTT_randomChoice(arr){
+  return arr[Math.floor(Math.random()*arr.length)];
+}
+
+
+/* -------------------- APPEARANCE + SPECIES MODEL -----------------------
+   Appearance is stored as permanent, human-readable prose in the Anatomy story card
+   (ENTRY), under an `APPEARANCE` section. This is NOT injected into AI context
+   automatically; it is a stable record we can optionally reference later.
+
+   Species is tracked separately from traits. Species init is confidence-based and
+   defaults to HUMAN when unknown. Once locked, species is sticky and only changes
+   with strong direct evidence of a species transformation.
+------------------------------------------------------------------------- */
+
+var BTT_SPECIES_LEXICON = [
+  // Core humanoids + common monster-girl / romantasy species
+  "human","elf","dwarf","orc","goblin","harpy","imp","minotaur","centaur","satyr",
+  "fae","fairy","angel","demon","tiefling","vampire","werewolf","dragon","dragonkin",
+  "naga","lamia","merfolk","siren","succubus","incubus","kitsune","slime",
+  "catgirl","nekomimi","bunnygirl","foxgirl","elemental","golem"
+];
+
+function BTT_normSpecies(s){
+  s = String(s||"").toLowerCase().trim();
+  s = s.replace(/[^a-z0-9\- ]+/g,"").trim();
+  if(s==="wolfman") return "werewolf";
+  if(s==="sirens") return "siren";
+  return s;
+}
+
+function BTT_detectSpeciesConfidence(text){
+  var t = String(text||"").toLowerCase();
+
+  // Strong identity: "you are an elf"
+  var m = t.match(/\byou (?:are|re|were)\s+(?:an?\s+)?([a-z\- ]{3,25})\b/);
+  if(m){
+    var cand = BTT_normSpecies(m[1]);
+    if(BTT_SPECIES_LEXICON.indexOf(cand)!==-1) return { species:cand, conf:0.95, reason:"identity" };
+  }
+
+  // Medium: ownership phrasing: "your elven ears" / "as a goblin"
+  for(var i=0;i<BTT_SPECIES_LEXICON.length;i++){
+    var sp = BTT_SPECIES_LEXICON[i];
+    if(!sp) continue;
+    if(t.indexOf("your "+sp)!==-1 || t.indexOf("as a "+sp)!==-1) return { species:sp, conf:0.75, reason:"owned-mention" };
+  }
+
+  // Default
+  return { species:"human", conf:0.40, reason:"default" };
+}
+
+function BTT_applySpeciesInit(meta, text){
+  if(!meta) return;
+  var det = BTT_detectSpeciesConfidence(text);
+  if(!det) return;
+
+  if(meta.speciesLocked && det.species !== meta.species){
+    // Sticky: only change with very strong evidence.
+    if(det.conf >= 0.90){
+      meta.species = det.species;
+      meta.speciesConf = det.conf;
+    }
+    return;
+  }
+
+  // Not locked: adopt if strong enough.
+  if(det.conf >= 0.70){
+    meta.species = det.species;
+    meta.speciesConf = det.conf;
+    meta.speciesLocked = true;
+    return;
+  }
+
+  // Otherwise just ensure a default exists.
+  if(!meta.species){
+    meta.species = det.species;
+    meta.speciesConf = det.conf;
+  }
+}
+
+function BTT_setAppearanceField(meta, key, value, sourceTag){
+  if(!meta) return;
+  // Appearance is a lightweight, low-threshold model separate from trait commits.
+  // It can update on partial / circumstantial evidence and is allowed to change more often.
+  if(!meta.appearance) meta.appearance = { summary:"", fields:{}, evidence:[] };
+  if(!meta.appearance.fields) meta.appearance.fields = {};
+  if(!meta.appearance.evidence) meta.appearance.evidence = [];
+  if(value){
+    meta.appearance.fields[key] = String(value).trim();
+    // Track where this came from (GID, INIT, etc.) for debug transparency.
+    BTT_pushAppearanceEvidence(meta, sourceTag || "(unknown)", key, meta.appearance.fields[key]);
+  }
+}
+
+function BTT_pushAppearanceEvidence(meta, sourceTag, key, value){
+  if(!meta || !key || !value) return;
+  if(!meta.appearance) meta.appearance = { summary:"", fields:{}, evidence:[] };
+  if(!meta.appearance.evidence) meta.appearance.evidence = [];
+  // Keep this very small; it's debug-visible and persisted via the anatomy card.
+  meta.appearance.evidence.push({ src:String(sourceTag||"?").slice(0,24), key:String(key), val:String(value) });
+  if(meta.appearance.evidence.length > 24) meta.appearance.evidence = meta.appearance.evidence.slice(-24);
+}
+
+function BTT_detectAppearanceFromText(meta, text, sourceTag, isInitPhase){
+  // Lightweight appearance field extraction.
+  // - During INIT, we allow "you ..." and "with ..." descriptions to resolve to player ownership.
+  // - During non-init turns, we stay ownership-gated and conservative.
+  isInitPhase = !!isInitPhase;
+  var t = String(text||"").toLowerCase();
+
+  // Hair: "your long black hair"
+  var mh = t.match(/\byour\s+((?:short|long|shoulder-length|cropped|messy|sleek)\s+)?(black|brown|blonde|red|auburn|silver|white|gray|grey|pink|purple|blue|green)\s+hair\b/);
+  if(mh){
+    var len = String(mh[1]||"").trim();
+    var col = String(mh[2]||"").trim();
+    BTT_setAppearanceField(meta,"hair", (len?len+" ":"")+col+" hair", sourceTag);
+  }
+
+  // Hair (expanded): sentence forms like "Your hair is a dark brown... of moderate length."
+  // Captures separate color/length fields when possible.
+  var mh2 = t.match(/\byour\s+hair\s+(?:is|was|looks|appears)\s+(?:a\s+)?((?:dark|light|deep)\s+)?(black|brown|blonde|red|auburn|silver|white|gray|grey)\b[^\n\r\.]{0,80}?(?:\bof\s+)?(short|long|moderate|medium|shoulder-length)\s+length\b/);
+  if(mh2){
+    var hc = String(((mh2[1]||"") + (mh2[2]||""))).trim().replace(/\s+/g," ");
+    var hl = String(mh2[3]||"").trim();
+    if(hc) BTT_setAppearanceField(meta,"hair_color", hc, sourceTag);
+    if(hl) BTT_setAppearanceField(meta,"hair_length", hl, sourceTag);
+    // Keep legacy combined field too, for backwards compatibility
+    if(hc) BTT_setAppearanceField(meta,"hair", (hl?hl+" ":"") + hc + " hair", sourceTag);
+  }
+
+  // Eyes
+  var me = t.match(/\byour\s+(blue|green|brown|hazel|gray|grey|amber|violet|golden|red)\s+eyes\b/);
+  if(me){
+    var ec = String(me[1]||"").trim();
+    BTT_setAppearanceField(meta,"eyes", ec + " eyes", sourceTag);
+    BTT_setAppearanceField(meta,"eye_color", ec, sourceTag);
+  }
+
+  // Eyes (expanded): sentence forms like "Your eyes are a deep, resolute green." (allows commas/adjectives)
+  var me2 = t.match(/\byour\s+eyes\s+(?:are|were|look|appear)[^\n\r\.]{0,40}\b(blue|green|brown|hazel|gray|grey|amber|violet|golden|red)\b/);
+  if(me2){
+    var ec2 = String(me2[1]||"").trim();
+    BTT_setAppearanceField(meta,"eyes", ec2 + " eyes", sourceTag);
+    BTT_setAppearanceField(meta,"eye_color", ec2, sourceTag);
+  }
+
+  // Skin
+  var ms = t.match(/\byour\s+(pale|tan|tanned|dark|brown|olive|fair)\s+skin\b/);
+  if(ms) BTT_setAppearanceField(meta,"skin", ms[1]+" skin", sourceTag);
+
+  // INIT relaxation: "you ... with pale skin" / "with pale skin" / "his pale skin".
+  if(!ms && isInitPhase){
+    var ms2 = t.match(/\b(?:you|he|his|your)\b[^\n\r\.]{0,80}\bwith\s+(pale|tan|tanned|dark|brown|olive|fair|smooth|creamy|soft)\s+skin\b/);
+    if(!ms2) ms2 = t.match(/\bwith\s+(pale|tan|tanned|dark|brown|olive|fair|smooth|creamy|soft)\s+skin\b/);
+    if(ms2) BTT_setAppearanceField(meta,"skin", ms2[1]+" skin", sourceTag);
+  }
+
+  // Build
+  var mb = t.match(/\byour\s+(lean|slim|slender|athletic|muscular|stocky|curvy|thick)\s+(?:body|frame)\b/);
+  if(mb) BTT_setAppearanceField(meta,"build", mb[1]+" build", sourceTag);
+
+  // INIT relaxation: common prose like "broad and thick of build" or "broad-shouldered and thick of ...".
+  if(!mb && isInitPhase){
+    var mb2 = t.match(/\b(broad|lean|slim|slender|athletic|muscular|stocky|curvy|thick)\b[^\n\r\.]{0,30}\bof\s+build\b/);
+    if(!mb2) mb2 = t.match(/\b(broad|lean|slim|slender|athletic|muscular|stocky|curvy|thick)\b[^\n\r\.]{0,30}\bframe\b/);
+    if(mb2) BTT_setAppearanceField(meta,"build", mb2[1]+" build", sourceTag);
+  }
+
+  // Scent (kept as a descriptive field; not a mechanical trait)
+  // Examples:
+  //   "your scent turns sweet, like honey and musk"
+  //   "your scent is sharp and masculine"
+  var msc = t.match(/\byour\s+scent\s+(?:is|turns|becomes|grows)\s+([^\n\r\.]{3,80})/);
+  if(msc){
+    var sv = String(msc[1]||"").trim();
+    // Trim trailing commas/quotes.
+    sv = sv.replace(/[\s,;:"']+$/g, "");
+    if(sv.length) BTT_setAppearanceField(meta,"scent", sv, sourceTag);
+  }
+
+  // Scent (expanded): "your very scent changing into ...".
+  if(!msc){
+    var msc2 = t.match(/\byour\s+(?:very\s+)?scent\s+(?:changes|change|changing)\s+(?:into|to)\s+([^\n\r\.]{3,100})/);
+    if(msc2){
+      var sv2 = String(msc2[1]||"").trim();
+      sv2 = sv2.replace(/[\s,;:"']+$/g, "");
+      if(sv2.length) BTT_setAppearanceField(meta,"scent", sv2, sourceTag);
+    }
+  }
+
+  // Scent (expanded): narrative "the air around you/him carries ..." (INIT only).
+  if(isInitPhase && (!meta.appearance || !meta.appearance.fields || !meta.appearance.fields.scent)){
+    var msc3 = t.match(/\bthe\s+air\s+around\s+(?:you|him)\s+carries\s+([^\n\r\.]{3,120})/);
+    if(msc3){
+      var sv3 = String(msc3[1]||"").trim();
+      sv3 = sv3.replace(/[\s,;:"']+$/g, "");
+      if(sv3.length) BTT_setAppearanceField(meta,"scent", sv3, sourceTag);
+    }
+  }
+
+  // Breasts / chest size impression (qualitative; not inches).
+  // We treat this as appearance evidence, not a hard trait commit.
+  // Examples: "budding", "swelling", "full", "heavy", "massive".
+  var bc = null;
+  if(/\\byour\s+(?:small\s+)?tender\s+buds\\b/.test(t) || /\\bbudding\s+breasts\\b/.test(t) || /\\bbreast\s+buds\\b/.test(t)) bc = 'budding';
+  else if(/\\byour\s+breasts\s+(?:begin\s+to\s+)?swell/.test(t) || /\\bswelling\s+breasts\\b/.test(t) || /\\bfullness\s+begins\s+to\s+bloom\s+in\s+your\s+chest\\b/.test(t)) bc = 'swelling';
+  else if(/\\bfull,?\s+heavy\s+breasts\\b/.test(t) || /\\bfull\s+breasts\\b/.test(t)) bc = 'full';
+  else if(/\\bheavy\s+breasts\\b/.test(t) || /\\bheavy\s+globes\\b/.test(t) || /\\bperfect,?\s+heavy\s+globes\\b/.test(t)) bc = 'heavy';
+  else if(/\\bmassive\s+breasts\\b/.test(t) || /\\benormous\s+breasts\\b/.test(t) || /\\bimpossibly\s+large\s+breasts\\b/.test(t) || /\\bhuge\s+breasts\\b/.test(t)) bc = 'massive';
+
+  // If the text strongly implies upward pressure on fabric, it's a size *increase* signal.
+  if(!bc && (/\\bstrain(?:ing)?\s+against\s+(?:your\s+)?(?:shirt|fabric|cloth|vest)\\b/.test(t) || /\\bstraining\s+fabric\\b/.test(t))) bc = 'increasing';
+
+  if(bc){
+    BTT_setAppearanceField(meta, 'cup', bc, sourceTag);
+  }
+}
+
+function BTT_slotHasTrait(meta, slot, trait){
+  if(!meta || !meta.slots || !meta.slots[slot] || !meta.slots[slot].traits) return false;
+  var tr = meta.slots[slot].traits;
+  for(var i=0;i<tr.length;i++){
+    if(String(tr[i]).toLowerCase() === String(trait).toLowerCase()) return true;
+  }
+  return false;
+}
+
+function BTT_slotHasAnyTrait(meta, slot, traits){
+  if(!traits || !traits.length) return false;
+  for(var i=0;i<traits.length;i++){
+    if(BTT_slotHasTrait(meta, slot, traits[i])) return true;
+  }
+  return false;
+}
+
+function BTT_buildAppearanceSummary(meta){
+  // 3–4 sentences, nude-forward visual description.
+  // NOTE:
+  // - This summary is intended for the anatomy/story-card record and selective injection.
+  // - It is NOT assumed to be always-on context.
+  // - It should be descriptive without labeling anatomy as "new".
+  if(!meta) return "";
+  if(!meta.appearance) meta.appearance = { summary:"", fields:{} };
+
+  var f = meta.appearance.fields || {};
+  var sp = meta.species || "human";
+
+  // Sentence 1: broad baseline
+  var s1 = "Nude, you look like a " + sp;
+  if(f.build) s1 += " with a " + f.build;
+  s1 += ".";
+
+  // Sentence 2: face/skin/hair/eyes/scent
+  var s2Parts = [];
+  if(f.skin) s2Parts.push(""+f.skin);
+  if(f.hair) s2Parts.push(""+f.hair);
+  if(f.eyes) s2Parts.push(""+f.eyes);
+  var s2 = s2Parts.length ? ("Up close, you notice " + s2Parts.join(", ") + ".") : "";
+  var s2b = f.scent ? ("A lingering scent clings to you: " + f.scent + ".") : "";
+
+  // Sentence 3: primary visible anatomy
+  var anat = [];
+  // Chest
+  if(meta.slots && meta.slots.breasts && meta.slots.breasts.traits){
+    var cup = null;
+    for(var i=0;i<meta.slots.breasts.traits.length;i++){
+      var bt = meta.slots.breasts.traits[i];
+      if(BTT_isCupTrait(bt)){ cup = bt; break; }
+    }
+    if(cup && cup!=="flat") anat.push("a " + cup + " chest");
+    else if(cup==="flat") anat.push("a flat chest");
+  }
+
+  // Genitals
+  if(meta.slots && meta.slots.penis){
+    // If we have any strong penile descriptors later, we'll expand here.
+    anat.push("a penis");
+  }
+  if(meta.slots && meta.slots.vagina){
+    anat.push("a vagina");
+  }
+
+  // Tail (more descriptive when it carries genital traits)
+  if(meta.slots && meta.slots.tail){
+    var tailAdj = [];
+    if(BTT_slotHasTrait(meta,"tail","sinuous")) tailAdj.push("sinuous");
+    if(BTT_slotHasTrait(meta,"tail","prehensile")) tailAdj.push("prehensile");
+    if(BTT_slotHasTrait(meta,"tail","velvety")) tailAdj.push("velvety");
+    if(BTT_slotHasTrait(meta,"tail","glistening")) tailAdj.push("glistening");
+    if(BTT_slotHasTrait(meta,"tail","wet")) tailAdj.push("wet");
+    if(BTT_slotHasTrait(meta,"tail","slick")) tailAdj.push("slick");
+
+    var tailCore = "tail";
+    if(BTT_slotHasAnyTrait(meta,"tail",["vaginal","pussy","vagina"])) tailCore = "tail ending in a vaginal opening";
+
+    // Add slime/parasite flavor as prefixes (keeps slot-agnostic trait handling).
+    var tailPrefix = [];
+    if(BTT_slotHasTrait(meta,"tail","slime")) tailPrefix.push("slime-sheathed");
+    if(BTT_slotHasTrait(meta,"tail","parasite")) tailPrefix.push("parasitic");
+
+    var allAdj = tailPrefix.concat(tailAdj);
+    var tailPhrase = "a " + (allAdj.length ? (allAdj.join(", ") + " ") : "") + tailCore;
+    anat.push(tailPhrase);
+  }
+
+  var s3 = anat.length ? ("Your body includes " + anat.join(", ") + ".") : "";
+
+  // Sentence 4: overall silhouette + presence (uses fem scalar when available)
+  var fem = Number(meta && meta.overallFem);
+  if(isNaN(fem)) fem = 0;
+
+  var vibe = [];
+  if(fem >= 60) vibe.push("decidedly feminine");
+  else if(fem >= 25) vibe.push("softly feminine");
+  else if(fem <= -60) vibe.push("decidedly masculine");
+  else if(fem <= -25) vibe.push("ruggedly masculine");
+  else vibe.push("androgynous");
+
+  // Add a few slot-driven vibe cues without overcommitting detail.
+  if(BTT_slotHasTrait(meta,"tail","parasite")) vibe.push("unmistakably altered");
+  if(BTT_slotHasTrait(meta,"tail","slime")) vibe.push("slickly inhuman");
+
+  var s4 = "The overall impression is " + vibe.join(" and ") + ", with every visible detail reinforcing the reality of your changed body.";
+
+  var out = [s1, s2, s2b, s3, s4].filter(function(x){ return x && String(x).trim().length>0; }).join(" ");
+  meta.appearance.summary = out;
+  return out;
+}
+
+function BTT_pickCupForGender(g){
+  // Natural-ish baseline ranges (can still evolve via transformations later)
+  if(g==="male") return "flat";
+  if(g==="femboy") return BTT_randomChoice(["aaa","aa"]);
+  if(g==="hermaphrodite") return BTT_randomChoice(["a","b"]);
+  if(g==="futanari") return BTT_randomChoice(["b","c","d"]);
+  if(g==="female") return BTT_randomChoice(["a","b","c","d"]);
+  return "flat";
+}
+
+function BTT_baselineSlotsForGender(gender){
+  var slots = {};
+  function mk(traits, fertility, virility){
+    return { traits: traits.slice(0), fertility: fertility, virility: virility, updatedTurn: 0 };
+  }
+  var cup = BTT_pickCupForGender(gender);
+
+  slots.head = mk(["human"], null, null);
+  // Hair is considered part of the head for tracking purposes (not its own slot).
+  slots.arms = mk(["human"], null, null);
+  slots.legs = mk(["human"], null, null);
+  slots.breasts = mk(["human", cup], null, null);
+  slots.gut = mk(["human"], null, null);
+  slots.ass = mk(["human"], 0, null);
+
+  // Genitals by identity baseline
+  if(gender === "male" || gender === "femboy"){
+    slots.penis = mk(["human"], null, 20);
+  } else if(gender === "female"){
+    slots.vagina = mk(["human"], 20, null);
+  } else if(gender === "hermaphrodite" || gender === "futanari"){
+    slots.penis = mk(["human"], null, 20);
+    slots.vagina = mk(["human"], 20, null);
+  }
+  return slots;
+}
+
+function BTT_buildDefaultEntry(labelUpper, meta){
+  var lines = [];
+  lines.push(labelUpper + " ANATOMY (BTT)");
+  lines.push("");
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    if(slot === "misc") continue;
+    var s = (meta && meta.slots) ? meta.slots[slot] : null;
+    if(!s){
+      lines.push(slot.toUpperCase() + ": none");
+      continue;
+    }
+    BTT_sanitizeSlotTraits(s);
+    var rhs = (s.traits && s.traits.length) ? s.traits.join("; ") : "human";
+    lines.push(slot.toUpperCase() + ": " + rhs);
+  }
+  lines.push("");
+  lines.push("Femininity (overall): " + Math.max(-100, Math.min(100, Number(meta && meta.overallFem)||0)));
+
+  // Species + decoupled appearance axes (stored on meta.appearance.axes; no prose in anatomy card)
+  BTT_appEnsure(meta);
+  var ax = (meta.appearance && meta.appearance.axes) ? meta.appearance.axes : {};
+  lines.push("");
+  lines.push("Species: " + String((meta && meta.species)||"human"));
+  lines.push("Breast Size: " + BTT_appPrettyBreastAxis(ax.breast_size));
+  lines.push("Ass Size: " + BTT_appClamp01(ax.ass_size));
+  lines.push("Cock Size: " + BTT_appClamp01(ax.cock_size));
+  lines.push("Fertility: " + BTT_appClamp01(ax.fertility));
+  lines.push("Virility: " + BTT_appClamp01(ax.virility));
+
+  // Appearance delta/evidence instrumentation (requested):
+  // Show per-pass axis deltas and the running delta since last AI refresh.
+  var _ap = meta.appearance || {};
+  var _nowT = BTT_getTurn();
+  var _lrt = Number(_ap.lastRefreshTurn);
+  var _baseTurn = isFinite(_lrt) ? _lrt : Number(meta._init_turn);
+  if(!isFinite(_baseTurn) || _baseTurn < 0) _baseTurn = 0;
+  var _tsr = Math.max(0, _nowT - _baseTurn);
+  _ap._turns_since_refresh = _tsr;
+  var _dsr = Number(_ap._delta_since_refresh)||0;
+  var _lad = _ap._last_axis_deltas || {};
+  var _ladKeys = Object.keys(_lad);
+  if(_ladKeys.length){
+    _ladKeys.sort();
+    var _ladParts = [];
+    for(var _i=0; _i<_ladKeys.length; _i++){
+      var _k = _ladKeys[_i];
+      var _v = Number(_lad[_k])||0;
+      if(!_v) continue;
+      _ladParts.push(_k + ":" + (_v>0?"+":"") + BTT_fmt2(_v));
+    }
+    if(_ladParts.length){
+      lines.push("");
+      lines.push("Appearance Δ (last pass): " + _ladParts.join(", "));
+      lines.push("Appearance Δ since refresh: " + BTT_fmt2(_dsr));
+      lines.push("Turns since refresh: " + _tsr);
+    }
+  }else{
+    // Still include the counters so you can verify turn tracking.
+    lines.push("");
+    lines.push("Appearance Δ since refresh: " + BTT_fmt2(_dsr));
+    lines.push("Turns since refresh: " + _tsr);
+  }
+
+  // Show the most recent appearance evidence lines (compact) to confirm accumulation.
+  if(_ap.evidence && Array.isArray(_ap.evidence) && _ap.evidence.length){
+    var _evN = 8;
+    var _ev = _ap.evidence.slice(Math.max(0, _ap.evidence.length - _evN));
+    lines.push("");
+    lines.push("Appearance Evidence (recent):");
+    for(var _e=0; _e<_ev.length; _e++){
+      lines.push("- " + String(_ev[_e]||""));
+    }
+  }
+
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+function BTT_parseJSON(str){
+  try{
+    var o = JSON.parse(String(str||""));
+    if(o && typeof o === "object" && !Array.isArray(o)) return o;
+  }catch(e){}
+  return null;
+}
+
+function BTT_getOrCreateEntityCard(entity){
+  if(!BTT_hasStoryCards()) return null;
+  var title = BTT_entityTitle(entity);
+  var sc = storyCards.find(function(c){ return c.title === title; });
+  if(!sc){
+    var keys = "btt, anatomy";
+    if(entity==="Player") keys += ", player, you, your";
+    addStoryCard(title, keys, "Anatomy");
+    sc = storyCards.find(function(c){ return c.title === title; });
+    if(sc){
+      var label = (entity==="Player") ? "PLAYER" : entity.slice(4).toUpperCase();
+      var meta = BTT_buildDefaultMeta(entity);
+      sc.entry = BTT_buildDefaultEntry(label, meta);
+      // Notes/Description is reserved for plain-text debug only.
+      sc.description = "";
+    }
+  }
+  
+// Create/find a TEMP story card used to force appearance-generation instructions
+// into the model context even when context_mode=excerpt truncates appended text.
+// This mirrors Auto-Cards' methodology: put the hard output contract into a card
+// so it cannot be dropped by excerpt trimming.
+function BTT_getOrCreateAppearanceGenCard(){
+  if(!BTT_hasStoryCards()) return null;
+  var title = "BTT | Appearance Gen (TEMP)";
+  var sc = storyCards.find(function(c){ return c.title === title; });
+  if(!sc){
+    // Keys chosen to match reliably during refresh (player-centric).
+    // Category "Instructions" is used to bias higher priority in many AID UIs.
+    addStoryCard(title, "btt, appearance_gen, player, you, your", "Instructions");
+    sc = storyCards.find(function(c){ return c.title === title; });
+    if(sc){
+      sc.entry = "";
+      sc.description = "";
+    }
+  }
+  return sc;
+}
+
+function BTT_setAppearanceGenCardText(promptText){
+  var sc = BTT_getOrCreateAppearanceGenCard();
+  if(!sc) return;
+  sc.entry = String(promptText||"");
+  // Notes/Description reserved for future debugging if needed.
+  if(typeof sc.description !== "string") sc.description = "";
+}
+
+function BTT_clearAppearanceGenCard(){
+  var sc = BTT_getOrCreateAppearanceGenCard();
+  if(!sc) return;
+  sc.entry = "";
+  if(typeof sc.description !== "string") sc.description = "";
+}
+return sc;
+}
+
+// Create/find a NON-INJECTING story card for durable, player-visible inspection.
+// This is used for the AI-authored appearance prose (PLAYER APPEARANCE) and any
+// other BTT “auxiliary” cards that should never inject into context.
+//
+// keys may be:
+// - array of keys, e.g. ["btt", "no_inject"]
+// - string of comma-separated keys
+// category defaults to "Notes".
+
+// ============================================================================
+// APPEARANCE / AXES — SANITIZATION + FALLBACKS (v2.63)
+// ----------------------------------------------------------------------------
+// Purpose:
+// - Prevent axis pseudo-traits (e.g. "breast-size-0") from polluting slot traits.
+// - Provide a deterministic fallback appearance paragraph when AI refresh capture
+//   is unavailable or the model refuses to emit tags.
+// Notes:
+// - This does NOT change slot scoring, trait thresholds, or group logic.
+// - Axis values remain stored in meta.appearance.axes and printed in axis lines.
+// ============================================================================
+
+function BTT_isAxisPseudoTrait(t){
+  if(!t) return false;
+  t = String(t).trim().toLowerCase();
+  return (
+    /^breast-size-\d+$/.test(t) ||
+    /^ass-size-\d+$/.test(t) ||
+    /^cock-size-\d+$/.test(t)
+  );
+}
+
+function BTT_sanitizeSlotTraits(slotObj){
+  if(!slotObj || !Array.isArray(slotObj.traits)) return;
+  var seen = {};
+  var out = [];
+  for(var i=0;i<slotObj.traits.length;i++){
+    var t = String(slotObj.traits[i]||"").trim();
+    if(!t) continue;
+    if(BTT_isAxisPseudoTrait(t)) continue; // axis pseudo-traits are presentation-only
+    var key = t.toLowerCase();
+    if(seen[key]) continue;
+    seen[key]=true;
+    out.push(t);
+  }
+  slotObj.traits = out;
+}
+
+function BTT_appFallbackDescription(meta){
+  // Deterministic, short paragraph built from fields + axes.
+  if(!meta) return "";
+  var app = meta.appearance || {};
+  var f = app.fields || {};
+  var ax = (app.axes)||{};
+  var species = app.species || meta.species || "human";
+
+  // Basic identity cues.
+  var parts = [];
+  parts.push("Nude, you look like a " + species + ".");
+
+  // Visible features.
+  var feat = [];
+  if(f.hair_color || f.hair_length){
+    var hc = (f.hair_color||"").trim();
+    var hl = (f.hair_length||"").trim();
+    if(hc && hl) feat.push(hc + ", " + hl + " hair");
+    else if(hc) feat.push(hc + " hair");
+    else if(hl) feat.push(hl + " hair");
+  }
+  if(f.eye_color) feat.push(String(f.eye_color).trim() + " eyes");
+  if(f.skin) feat.push(String(f.skin).trim());
+  if(f.build) feat.push(String(f.build).trim());
+  if(feat.length){
+    parts.push("You have " + feat.join(", ") + ".");
+  }
+
+  // Axes summary (kept short).
+  var axBits = [];
+  if(typeof ax.breast_size === "number") axBits.push("breast size " + ax.breast_size);
+  if(typeof ax.ass_size === "number") axBits.push("ass size " + ax.ass_size);
+  if(typeof ax.cock_size === "number" && (meta.gender==="male" || meta.gender==="herm" || meta.gender==="futa")) axBits.push("cock size " + ax.cock_size);
+  if(axBits.length){
+    parts.push("Key proportions: " + axBits.join(", ") + ".");
+  }
+
+  if(f.scent) parts.push("Your scent is " + String(f.scent).trim() + ".");
+
+  return parts.join(" ");
+}
+function BTT_getOrCreateStoryCard(title, keys, category){
+  if(!BTT_hasStoryCards()) return null;
+  title = String(title||"").trim();
+  if(!title) return null;
+
+  var sc = storyCards.find(function(c){ return c.title === title; });
+  if(sc) return sc;
+
+  category = String(category||"Notes").trim() || "Notes";
+  var keyStr = "btt, no_inject";
+  if(Array.isArray(keys)) keyStr = keys.join(", ");
+  else if(typeof keys === "string" && keys.trim()) keyStr = keys;
+
+  // AID helper
+  addStoryCard(title, keyStr, category);
+  sc = storyCards.find(function(c){ return c.title === title; });
+  if(sc){
+    sc.entry = String(title) + "\n\n";
+    sc.description = "";
+  }
+  return sc;
+}
+
+
+
+/* ============================================================================
+   BTT APPEARANCE ROUTER (INTERNAL, INJECTED)
+   ----------------------------------------------------------------------------
+   Purpose:
+   - Ensure the model reliably emits an AI-authored appearance paragraph that BTT
+     can capture and store into PLAYER APPEARANCE (BTT), without relying on
+     Inner Self (IS) or Auto Cards (AC) scripts.
+   - This uses BTT's own hooks + tags, and will not overlap with IS/AC formats.
+
+   How it works:
+   1) We maintain an injected system story card "BTT APPEARANCE ROUTER (BTT)".
+      Because it is injected (NO "no_inject" key), the model will see the
+      instructions every turn, even if the user is not running a Context hook.
+   2) The model appends a tagged block:
+        <<BTT_APPEARANCE_REFRESH>>
+        ...
+        <<END_BTT_APPEARANCE_REFRESH>>
+   3) onOutput_BTT strips that block from visible output and stores the prose as
+      meta.appearance.summary_ai, which BTT writes into PLAYER APPEARANCE (BTT).
+
+   Safety / compatibility:
+   - Keys are unique ("btt_router") so it won't collide with IS/AC.
+   - The router card contains only concise instructions + the current appearance
+     state snapshot (fields + axes). No anatomy or slot scoring details.
+============================================================================ */
+
+function BTT_buildAppearanceStateSnapshot(meta){
+  // Snapshot used ONLY for appearance refresh prompting.
+  // Shows current BTT-tracked appearance fields + raw axis values (two decimals).
+  BTT_appEnsure(meta);
+  var app = meta.appearance || {};
+  var f = app.fields || {};
+  var ax = app.axes || {};
+
+  function fmt(v){
+    if(typeof v !== "number" || !isFinite(v)) return "";
+    return v.toFixed(2);
+  }
+
+  var lines = [];
+  lines.push("Species: " + String(app.species||meta.species||"human"));
+  if(f.hair_color)  lines.push("Hair Color: " + String(f.hair_color));
+  if(f.hair_length) lines.push("Hair Length: " + String(f.hair_length));
+  if(f.eye_color)   lines.push("Eye Color: " + String(f.eye_color));
+  if(f.skin)        lines.push("Skin: " + String(f.skin));
+  if(f.build)       lines.push("Build: " + String(f.build));
+  if(f.scent)       lines.push("Scent: " + String(f.scent));
+
+  lines.push("");
+  lines.push("APPEARANCE AXES (raw, 0..100 unless noted):");
+  // fem axis is raw (-100..100 in older builds), and meta.overallFem is the derived overall score.
+  if(typeof ax.fem === "number") lines.push("fem_axis: " + fmt(ax.fem));
+  if(typeof meta.overallFem === "number") lines.push("overall_fem: " + fmt(meta.overallFem));
+  if(typeof ax.breast_size === "number") lines.push("breast_size: " + fmt(ax.breast_size));
+  if(typeof ax.ass_size === "number")    lines.push("ass_size: " + fmt(ax.ass_size));
+  if(typeof ax.cock_size === "number")   lines.push("cock_size: " + fmt(ax.cock_size));
+  if(typeof ax.fertility === "number")   lines.push("fertility: " + fmt(ax.fertility));
+  if(typeof ax.virility === "number")    lines.push("virility: " + fmt(ax.virility));
+
+  return lines.join("\n");
+}
+
+function BTT_buildAppearanceRouterEntry(meta){
+  var snap = BTT_buildAppearanceStateSnapshot(meta);
+
+  var instr = []
+  instr.push("INSTRUCTIONS (BTT):");
+  instr.push("- At the END of every assistant reply, append EXACTLY ONE appearance block.");
+  instr.push("- The block MUST be wrapped in the exact tags shown below.");
+  instr.push("- The prose MUST describe ONLY the player's CURRENT PHYSICAL APPEARANCE.");
+  instr.push("- Do NOT include story events, actions, dialogue, or inner thoughts.");
+  instr.push("- Use the CURRENT STATE snapshot as your source of truth.");
+  instr.push("");
+  instr.push("OUTPUT TEMPLATE (copy tags exactly):");
+  instr.push("<<BTT_APPEARANCE_REFRESH>>");
+  instr.push("<one concise paragraph, 1–4 sentences>");
+  instr.push("<<END_BTT_APPEARANCE_REFRESH>>");
+
+  return "BTT APPEARANCE ROUTER (BTT)\n\n" + instr.join("\n") + "\n\nCURRENT STATE:\n" + snap + "\n";
+}
+
+function BTT_writeAppearanceRouterCard(meta){
+  // Router story card disabled: we inject refresh instructions into ANATOMY (BTT) instead.
+  // This avoids overlap with Inner Self / Auto Cards systems.
+  return;
+
+  // Injected system card: DO NOT mark no_inject.
+  var sc = BTT_getOrCreateStoryCard("BTT APPEARANCE ROUTER (BTT)", "btt_router", "System");
+  if(!sc) return;
+
+  sc.entry = BTT_buildAppearanceRouterEntry(meta);
+  sc.description = "Injected system router card used by BTT to capture AI-authored appearance prose. Do not edit.";
+}
+
+function BTT_parseEntry(entry){
+  var out = {
+    slots:{},
+    overallFem:0,
+    species:"human",
+    appearance:{
+      summary:"",
+      summary_ai:"",
+      fields:{},
+      evidence:[],
+      axes:{ fem:0, fertility:0, virility:0, breast_size:0, ass_size:0, cock_size:0 }
+    }
+  };
+  if(typeof entry !== "string") return out;
+
+  var lines = entry.split("\n");
+
+  var inAppearanceEvidence = false;
+  for(var i=0;i<lines.length;i++){
+    var raw = lines[i];
+    var s = raw.trim();
+    if(!s) continue;
+
+    if(/^AppearanceEvidence\s*:/i.test(s)){
+      inAppearanceEvidence = true;
+      continue;
+    }
+
+    if(inAppearanceEvidence){
+      // Stop when we hit another section header.
+      if(/^(PLAYER\s+|HEAD\s*:|ARMS\s*:|LEGS\s*:|BREASTS\s*:|GUT\s*:|PENIS\s*:|VAGINA\s*:|ASS\s*:|TAIL\s*:|WINGS\s*:|Species\s*:|Appearance\s*:|Femininity\s*\(overall\)\s*:)/i.test(s)){
+        inAppearanceEvidence = false;
+      } else {
+        // Expected format:
+        // - key: value [src]
+        // * key: value
+        var em = s.match(/^[-*]\s*([^:]+):\s*(.+?)(?:\s*\[([^\]]+)\])?$/);
+        if(em){
+          out.appearance.evidence.push({ key: em[1].trim(), value: em[2].trim(), src: (em[3]||"").trim() });
+        }
+        continue;
+      }
+    }
+
+    var m = s.match(/^([A-Z]+)\s*:\s*(.*)$/);
+    if(m){
+      var slot = m[1].toLowerCase();
+      var rest = String(m[2]||"").trim();
+      if(BTT_SLOTS.indexOf(slot)===-1 || slot==="misc") continue;
+      if(/^none$/i.test(rest)) continue;
+
+      var tokens = rest.split(/[;,]/g).map(function(x){ return x.trim().toLowerCase(); }).filter(Boolean);
+      var traits = [];
+      var fertility = null, virility = null;
+      tokens.forEach(function(tok){
+        tok = String(tok||"").trim();
+        if(!tok) return;
+        // Parse axis scalars that may appear on slot lines, but do NOT store them as slot traits.
+        var fer = tok.match(/fertility\s+(\d+)/i);
+        if(fer){ fertility = Number(fer[1]); return; }
+        var vir = tok.match(/virility\s+(\d+)/i);
+        if(vir){ virility = Number(vir[1]); return; }
+        // Skip axis pseudo-traits and axis labels if present.
+        if(/^(breast|ass|cock)\s*size\s+\d+$/i.test(tok)) return;
+        if(/^(breast|ass|cock)-size-\d+$/i.test(tok.replace(/\s+/g,"-"))) return;
+        var norm = tok.replace(/\s+/g,"-");
+        traits.push(norm);
+      });
+      (function(){
+        // Final sanitation: remove axis pseudo-traits and duplicate tokens.
+        var seen = {};
+        var clean = [];
+        for(var ti=0; ti<traits.length; ti++){
+          var t = String(traits[ti]||"").trim();
+          if(!t) continue;
+          if(BTT_isAxisPseudoTrait(t)) continue;
+          var k = t.toLowerCase();
+          if(seen[k]) continue;
+          seen[k]=true;
+          clean.push(t);
+        }
+        traits = clean;
+      })();
+      out.slots[slot] = { traits: traits, fertility: fertility, virility: virility };
+      continue;
+    }
+
+
+
+    // Appearance/species lines (stored under the APPEARANCE section, but parsed anywhere).
+    var sp = s.match(/^Species\s*:\s*(.+)$/i);
+    if(sp){ out.species = String(sp[1]||"").trim().toLowerCase(); continue; }
+
+    var ap = s.match(/^Appearance\s*:\s*(.+)$/i);
+    if(ap){ out.appearance.summary = String(ap[1]||"").trim(); continue; }
+
+    // Decoupled appearance axes (persisted in anatomy card)
+    var axm;
+    axm = s.match(/^Breast\s*Size\s*:\s*(\d{1,3})/i);
+    if(axm){ out.appearance.axes.breast_size = BTT_appClamp01(Number(axm[1])); continue; }
+    axm = s.match(/^Ass\s*Size\s*:\s*(\d{1,3})/i);
+    if(axm){ out.appearance.axes.ass_size = BTT_appClamp01(Number(axm[1])); continue; }
+    axm = s.match(/^Cock\s*Size\s*:\s*(\d{1,3})/i);
+    if(axm){ out.appearance.axes.cock_size = BTT_appClamp01(Number(axm[1])); continue; }
+    axm = s.match(/^Fertility\s*:\s*(\d{1,3})/i);
+    if(axm){ out.appearance.axes.fertility = BTT_appClamp01(Number(axm[1])); continue; }
+    axm = s.match(/^Virility\s*:\s*(\d{1,3})/i);
+    if(axm){ out.appearance.axes.virility = BTT_appClamp01(Number(axm[1])); continue; }
+
+    // Extended appearance fields (persisted in anatomy card)
+    var hf2;
+    hf2 = s.match(/^Hair\s*Color\s*:\s*(.+)$/i);
+    if(hf2){ out.appearance.fields.hair_color = String(hf2[1]||"").trim(); continue; }
+    hf2 = s.match(/^Hair\s*Length\s*:\s*(.+)$/i);
+    if(hf2){ out.appearance.fields.hair_length = String(hf2[1]||"").trim(); continue; }
+    hf2 = s.match(/^Eye\s*Color\s*:\s*(.+)$/i);
+    if(hf2){ out.appearance.fields.eye_color = String(hf2[1]||"").trim(); continue; }
+    hf2 = s.match(/^Scent\s*:\s*(.+)$/i);
+    if(hf2){ out.appearance.fields.scent = String(hf2[1]||"").trim(); continue; }
+
+    var hf = s.match(/^(Hair|Eyes|Skin|Build)\s*:\s*(.+)$/i);
+    if(hf){ out.appearance.fields[hf[1].toLowerCase()] = String(hf[2]||"").trim(); continue; }
+    var f = s.match(/^Femininity\s*\(overall\)\s*:\s*([+-]?\d+)/i);
+    if(f) out.overallFem = Number(f[1])||0;
+  }
+  return out;
+}
+
+function BTT_inferGenderFromMeta(meta){
+  var hasPenis = !!meta.slots.penis;
+  var hasVagina = !!meta.slots.vagina;
+  if(hasPenis && hasVagina) return "hermaphrodite";
+  if(hasVagina) return "female";
+  if(hasPenis) return "male";
+  return "";
+}
+
+
+
+function BTT_metaHasAnyRealSlots(meta){
+  if(!meta || !meta.slots) return false;
+  for(var k in meta.slots){
+    if(!meta.slots.hasOwnProperty(k)) continue;
+    var s = meta.slots[k];
+    if(s && s.traits && s.traits.length) return true;
+  }
+  // Even when not (re)initializing, we update appearance/species cache from new owned descriptions.
+  BTT_applySpeciesInit(meta, t);
+  BTT_detectAppearanceFromText(meta, t, "INIT", true);
+
+  return false;
+}
+
+function BTT_loadEntity(entity){
+  var sc = BTT_getOrCreateEntityCard(entity);
+
+  // Canon comes from the card ENTRY; state is just a working cache.
+  var cache = state.BTT.entities[entity] || {};
+  var meta = cache.meta || BTT_buildDefaultMeta(entity);
+
+  if(sc && typeof sc.entry === "string"){
+    var parsed = BTT_parseEntry(sc.entry);
+    meta.slots = {};
+    for(var slot in parsed.slots){
+      if(!parsed.slots.hasOwnProperty(slot)) continue;
+      meta.slots[slot] = { traits:(parsed.slots[slot].traits||[]).slice(0), fertility:parsed.slots[slot].fertility, virility:parsed.slots[slot].virility, updatedTurn:0 };
+      if(meta.slots[slot].traits.length===0) meta.slots[slot].traits = ["human"];
+      if(typeof meta.slots[slot].fertility === "number") meta.slots[slot].fertility = Math.max(0, Math.min(100, meta.slots[slot].fertility));
+      if(typeof meta.slots[slot].virility === "number") meta.slots[slot].virility = Math.max(0, Math.min(100, meta.slots[slot].virility));
+    }
+    meta.overallFem = Math.max(-100, Math.min(100, Number(parsed.overallFem)||0));
+    meta.species = String(parsed.species||'human');
+    meta.speciesConf = Number(parsed.speciesConf)||meta.speciesConf||0;
+    if(parsed.appearance){
+      meta.appearance = {
+        summary: String(parsed.appearance.summary||''),
+        summary_ai: String(parsed.appearance.summary_ai||''),
+        fields: (parsed.appearance.fields||{}),
+        evidence: Array.isArray(parsed.appearance.evidence) ? parsed.appearance.evidence.slice(0) : [],
+        axes: (parsed.appearance.axes||{})
+      };
+    }
+
+  }
+
+  meta.entity = entity;
+  if(typeof meta.__initialized !== "boolean") meta.__initialized = false;
+  if(typeof meta.gender !== "string") meta.gender = "";
+  if(typeof meta.overallFem !== "number") meta.overallFem = 0;
+  if(typeof meta.species !== 'string') meta.species = 'human';
+  if(typeof meta.speciesConf !== 'number') meta.speciesConf = 0;
+  if(typeof meta.speciesLocked !== 'boolean') meta.speciesLocked = false;
+  if(!meta.appearance) meta.appearance = { summary:'', summary_ai:'', fields:{}, evidence:[] };
+  if(!meta.appearance.fields) meta.appearance.fields = {};
+  if(!Array.isArray(meta.appearance.evidence)) meta.appearance.evidence = [];
+
+  // Ensure decoupled axes exist even when loaded from older cards.
+  BTT_appEnsure(meta);
+
+  if(!meta.slots) meta.slots = {};
+
+  // Infer gender ONLY if anatomy is authoritative (non-empty slots)
+  if(!meta.gender && BTT_metaHasAnyRealSlots(meta)){
+    var ig = BTT_inferGenderFromMeta(meta);
+    if(ig) meta.gender = ig;
+  }
+
+  state.BTT.entities[entity] = { meta: meta };
+  return meta;
+}
+
+function BTT_writeEntity(entity, meta, debugLinesToAppend, cfg){
+  var sc = BTT_getOrCreateEntityCard(entity);
+  if(!sc) return;
+
+  var label = (entity==="Player") ? "PLAYER" : entity.slice(4).toUpperCase();
+
+  // Existing debug lives in Notes/description (plain text)
+  var existing = [];
+  if(typeof sc.description === "string" && sc.description.trim()){
+    var trimmed = sc.description.trim();
+    // If the Notes field still contains an old JSON blob from earlier versions, discard it.
+    if(trimmed.charAt(0)==="{" || trimmed.charAt(0)==="["){
+      existing = [];
+    }else{
+      existing = sc.description.split("\n").filter(function(l){ return String(l||"").trim().length>0; });
+    }
+  }
+
+  if(debugLinesToAppend && debugLinesToAppend.length){
+    existing = existing.concat(debugLinesToAppend);
+  }
+  // NOTE (logging):
+  // We keep debug logs in the card Notes/Description (not injected into context), but we still
+  // enforce a soft cap so very long runs do not bloat story cards or degrade performance.
+  var _bttMaxDebug = (cfg && typeof cfg.debug_max_lines === "number") ? cfg.debug_max_lines : 0;
+  if(_bttMaxDebug > 0 && existing.length > _bttMaxDebug){
+    existing = existing.slice(existing.length - _bttMaxDebug);
+  }
+  // IMPORTANT: never start mid-entry. If we cut by line-count, advance to the next group header.
+  // This prevents half entries in the visible debug log.
+  if(_bttMaxDebug > 0 && existing.length){
+    while(existing.length && !/^\s*G\d+\s*\|\s*slot=/.test(existing[0]) && !/^\s*INIT\s*\|/.test(existing[0])){
+      existing.shift();
+    }
+  }
+
+  // ENTRY = anatomy only (no debug, no JSON)
+  var lines = [];
+  lines.push(label + " ANATOMY (BTT)");
+  lines.push("");
+
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    if(slot === "misc") continue;
+    var s = meta.slots[slot];
+    if(!s){
+      lines.push(slot.toUpperCase() + ": none");
+      continue;
+    }
+    var rhs = (s.traits && s.traits.length) ? s.traits.join("; ") : "human";
+    BTT_appEnsure(meta);
+    var ax = (meta.appearance && meta.appearance.axes) ? meta.appearance.axes : {};
+    lines.push(slot.toUpperCase() + ": " + rhs);
+  }
+
+  lines.push("");
+  lines.push("Femininity (overall): " + Math.max(-100, Math.min(100, Number(meta.overallFem)||0)));
+
+  // Species + appearance axes are stored in the anatomy card (no prose here).
+  BTT_appEnsure(meta);
+  var ax = (meta.appearance && meta.appearance.axes) ? meta.appearance.axes : {};
+
+  lines.push("");
+  lines.push("Species: " + String(meta.species||"human"));
+  // Appearance fields (lightweight; ownership-gated). These are not slot traits.
+  var af = (meta.appearance && meta.appearance.fields) ? meta.appearance.fields : {};
+  lines.push("Hair Color: " + String(af.hair_color||""));
+  lines.push("Hair Length: " + String(af.hair_length||""));
+  lines.push("Eye Color: " + String(af.eye_color||""));
+  lines.push("Skin: " + String(af.skin||""));
+  lines.push("Build: " + String(af.build||""));
+  lines.push("Scent: " + String(af.scent||""));
+
+  lines.push("Breast Size: " + BTT_appPrettyBreastAxis(ax.breast_size));
+  lines.push("Ass Size: " + BTT_appClamp01(ax.ass_size));
+  lines.push("Cock Size: " + BTT_appClamp01(ax.cock_size));
+  lines.push("Fertility: " + BTT_appClamp01(ax.fertility));
+  lines.push("Virility: " + BTT_appClamp01(ax.virility));
+
+  // Appearance delta/evidence instrumentation (requested):
+  // Show per-pass axis deltas and the running delta since last AI refresh.
+  var _ap = meta.appearance || {};
+  var _nowT = BTT_getTurn();
+  var _lrt = Number(_ap.lastRefreshTurn);
+  var _baseTurn = isFinite(_lrt) ? _lrt : Number(meta._init_turn);
+  if(!isFinite(_baseTurn) || _baseTurn < 0) _baseTurn = 0; // init/unrefreshed => treat as now for spacing display
+  var _tsr = Math.max(0, _nowT - _baseTurn);
+  _ap._turns_since_refresh = _tsr;
+
+  var _dsr = Number(_ap._delta_since_refresh)||0;
+  var _lad = _ap._last_axis_deltas || {};
+  var _ladKeys = Object.keys(_lad);
+  if(_ladKeys.length){
+    _ladKeys.sort();
+    var _ladParts = [];
+    for(var _i=0; _i<_ladKeys.length; _i++){
+      var _k = _ladKeys[_i];
+      var _v = Number(_lad[_k])||0;
+      if(!_v) continue;
+      _ladParts.push(_k + ":" + (_v>0?"+":"") + BTT_fmt2(_v));
+    }
+    if(_ladParts.length){
+      lines.push("");
+      lines.push("Appearance Δ (last pass): " + _ladParts.join(", "));
+    }
+  }
+  lines.push("Appearance Δ since refresh: " + BTT_fmt2(_dsr));
+  lines.push("Turns since refresh: " + _tsr);
+
+  // Include a short tail of evidence strings to help validate incremental detection.
+  var _ev = Array.isArray(_ap._evidence) ? _ap._evidence : [];
+  if(_ev.length){
+    lines.push("");
+    lines.push("Appearance Evidence (latest):");
+    var _take = Math.min(6, _ev.length);
+    for(var _j=_ev.length-_take; _j<_ev.length; _j++){
+      lines.push("- " + String(_ev[_j]||""));
+    }
+  }
+
+  sc.entry = lines.join("\n");
+
+  // NOTES/DESCRIPTION = debug only
+  sc.description = existing.length ? existing.join("\n") : "";
+
+  // Separate, non-injecting card for the AI-written appearance refresh prose.
+  // This avoids crossing triggers with InnerSelf/AutoCards while still giving
+  // you a durable place to inspect the latest AI-authored appearance text.
+  if(meta && meta.appearance){
+    var asc = BTT_getOrCreateStoryCard("PLAYER APPEARANCE (BTT)", ["btt_player_appearance", "no_inject"], "Notes");
+    /* ---------------------------------------------------------------------
+       PLAYER APPEARANCE (BTT) RENDER POLICY
+       ---------------------------------------------------------------------
+       This card is intended to be AI-authored ONLY.
+
+       We intentionally do NOT fall back to script-generated prose (seed/summary/
+       BTT_appFallbackDescription), because that masks failures in the appearance
+       refresh pipeline.
+
+       Contract:
+       - If an AI-authored refresh has been captured: show meta.appearance.summary_ai
+       - Otherwise: show a loud, explicit placeholder for debugging.
+    --------------------------------------------------------------------- */
+    var _bttAppDesc = "";
+    if(meta.appearance && typeof meta.appearance.summary_ai === "string" && meta.appearance.summary_ai.trim()){
+      _bttAppDesc = meta.appearance.summary_ai.trim();
+    }
+    if(!_bttAppDesc){
+      _bttAppDesc = "Initialized, No AI description";
+    }
+    if(asc){
+      asc.entry = "PLAYER APPEARANCE (BTT)\n\n" + String((_bttAppDesc||"")).trim();
+            // Notes: include a compact debug readout of the current appearance axes.
+      // Requested format: current axis levels to two decimals per category.
+      var _axDbg = "";
+      try{
+        BTT_appEnsure(meta);
+        var _ax = (meta && meta.appearance && meta.appearance.axes) ? meta.appearance.axes : {};
+        var _kys = Object.keys(_ax||{}).sort();
+        var _parts = [];
+        for(var _di=0; _di<_kys.length; _di++){
+          var _kk = _kys[_di];
+          var _vv = Number(_ax[_kk]);
+          if(!isFinite(_vv)) _vv = 0;
+          _parts.push(_kk + ": " + BTT_fmt2(_vv));
+        }
+        if(_parts.length){
+          _axDbg = "\n\n--- DEBUG (Appearance Axes) ---\n" + _parts.join(" | ");
+        }
+      }catch(_eAxDbg){}
+      asc.description = "BTT-managed appearance description. Seeded from init; overwritten when AI refresh tags are captured." + _axDbg;
+    }
+  }
+}
+
+/* ------------------ IDENTITY-ONLY GENDER INIT --------------------------- */
+
+var BTT_GENDER_PATTERNS = {
+  // Identity-only patterns (do NOT fire on preference/partner mentions)
+  male: [
+    /\byou are (?:a |an )?man\b/i, /\byou are (?:a |an )?male\b/i,
+    /\bi am (?:a |an )?man\b/i,   /\bi am (?:a |an )?male\b/i,
+    /\byou are a normal human male\b/i, /\bi am a normal human male\b/i
+  ],
+  female: [
+    /\byou are (?:a |an )?woman\b/i, /\byou are (?:a |an )?female\b/i,
+    /\bi am (?:a |an )?woman\b/i,   /\bi am (?:a |an )?female\b/i,
+    /\byou are a normal human female\b/i, /\bi am a normal human female\b/i
+  ],
+  femboy: [
+    /\byou are (?:a |an )?femboy\b/i, /\bi am (?:a |an )?femboy\b/i,
+    /\byou are (?:a |an )?feminine boy\b/i, /\bi am (?:a |an )?feminine boy\b/i
+  ],
+  hermaphrodite: [
+    /\byou are (?:a |an )?hermaphrodite\b/i, /\bi am (?:a |an )?hermaphrodite\b/i,
+    /\byou are (?:a |an )?intersex\b/i,       /\bi am (?:a |an )?intersex\b/i
+  ],
+  futanari: [
+    /\byou are (?:a |an )?futanari\b/i, /\bi am (?:a |an )?futanari\b/i,
+    /\byou are (?:a |an )?futa\b/i,     /\bi am (?:a |an )?futa\b/i
+  ]
+};
+
+function BTT_detectGender(text){
+  var s = String(text||"").replace(/\s+/g," ").trim();
+  if(!s) return null;
+
+  // Priority: explicit niche identities first
+  if(BTT_GENDER_PATTERNS.futanari.some(function(r){ return r.test(s); })) return "futanari";
+  if(BTT_GENDER_PATTERNS.hermaphrodite.some(function(r){ return r.test(s); })) return "hermaphrodite";
+  if(BTT_GENDER_PATTERNS.femboy.some(function(r){ return r.test(s); })) return "femboy";
+  if(BTT_GENDER_PATTERNS.female.some(function(r){ return r.test(s); })) return "female";
+  if(BTT_GENDER_PATTERNS.male.some(function(r){ return r.test(s); })) return "male";
+  return null;
+}
+
+
+// Confidence-based gender detection for initialization.
+// This complements identity-only patterns by allowing anatomy-driven init
+// from typical story prose (e.g. "your cock", "your pussy").
+//
+// Returns: { gender: <string|null>, conf: 0..1, reason: <string> }
+function BTT_detectGenderConfidence(text){
+  var t = String(text||"").toLowerCase();
+  var id = BTT_detectGender(t); // identity-only
+  if(id) return { gender:id, conf:0.95, reason:"identity" };
+
+  var male = 0, female = 0;
+  // Ownership-anchored genital cues
+  if(/\byour\s+(cock|penis|dick|balls|testes)\b/.test(t)) male += 0.45;
+  if(/\byour\s+(pussy|vagina|cunt|slit)\b/.test(t)) female += 0.45;
+  // Secondary presentation cues
+  if(/\byour\s+breasts?\b/.test(t)) female += 0.20;
+  if(/\byour\s+beard\b/.test(t)) male += 0.15;
+
+  // Clamp and decide
+  male = Math.min(1, male);
+  female = Math.min(1, female);
+  if(male>=0.60 && male>female+0.15) return { gender:"male", conf:male, reason:"anatomy" };
+  if(female>=0.60 && female>male+0.15) return { gender:"female", conf:female, reason:"anatomy" };
+  if(male>=0.45 && female>=0.45) return { gender:"hermaphrodite", conf:Math.min(0.70, (male+female)/2), reason:"mixed-anatomy" };
+
+  return { gender:null, conf:Math.max(male,female), reason:"none" };
+}
+
+function BTT_genderBaselineFem(g){
+  if(g==="hermaphrodite") return 0;
+  if(g==="androgynous") return 0;
+if(g==="male") return -50;
+  if(g==="female") return 50;
+  if(g==="femboy") return 10;
+  if(g==="futanari") return 30;
+  if(g==="hermaphrodite") return 0;
+  return 0;
+}
+
+/* ------------------------ BASELINE INIT -------------------------------- */
+
+function BTT_hash32(str){
+  // Simple deterministic hash for stable baseline picks.
+  str = String(str||"");
+  var h = 2166136261;
+  for(var i=0;i<str.length;i++){
+    h ^= str.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function BTT_pickFrom(arr, seed){
+  if(!arr || !arr.length) return null;
+  var idx = (seed >>> 0) % arr.length;
+  return arr[idx];
+}
+
+var BTT_CUP_RANGES = {
+  androgynous: ["flat","aa cup"],
+  male: ["flat"],
+  female: ["b cup","c cup","d cup"],
+  femboy: ["aaa cup","aa cup"],
+  hermaphrodite: ["a cup","b cup"],
+  futanari: ["b cup","c cup"]
+};
+
+function BTT_baselinePartsForGender(g){
+  // Human baseline body parts; absence is represented by missing slots (rendered as "none").
+  // Always-present baseline slots for a humanoid body.
+  // Note: "hair" is treated as a head descriptor and is NOT tracked as a slot.
+  var parts = ["head","arms","legs","breasts","gut","ass"];
+  if(g==="male" || g==="femboy" || g==="hermaphrodite" || g==="futanari") parts.push("penis");
+  if(g==="female" || g==="hermaphrodite" || g==="futanari") parts.push("vagina");
+  return parts;
+}
+
+function BTT_applyBaseline(meta, gender, seedText){
+  gender = (gender || "hermaphrodite").toLowerCase();
+
+  function setSlot(slot, traits, fertility, virility){
+    meta.slots[slot] = {
+      traits: traits.slice(),
+      fertility: (fertility===undefined ? null : fertility),
+      virility: (virility===undefined ? null : virility),
+      updatedTurn: 0
+    };
+  }
+
+  // Reset and define only baseline-present slots.
+  meta.slots = {};
+
+  // Common human baseline race (species). Sex baseline determines which slots exist.
+  setSlot("head", ["human"], null, null);
+  // hair slot intentionally omitted (handled under head)
+  setSlot("arms", ["human"], null, null);
+  setSlot("legs", ["human"], null, null);
+  setSlot("gut", ["human"], null, null);
+  setSlot("ass", ["human"], 0, null);
+
+  // Breasts exist; cup is mutually exclusive.
+  var cup = "flat";
+  if(gender==="male") cup = "flat";
+  else if(gender==="female") cup = "c";
+  else if(gender==="femboy") cup = "aa";
+  else if(gender==="hermaphrodite") cup = "b";
+  else cup = "b";
+
+  setSlot("breasts", ["human", cup], null, null);
+
+  if(gender==="male"){
+    setSlot("penis", ["human"], null, 20);
+  }else if(gender==="female"){
+    setSlot("vagina", ["human"], 20, null);
+  }else if(gender==="femboy"){
+    setSlot("penis", ["human"], null, 15);
+    setSlot("vagina", ["human"], 10, null);
+  }else{ // hermaphrodite + fallback
+    setSlot("penis", ["human"], null, 20);
+    setSlot("vagina", ["human"], 20, null);
+  }
+
+  // Optional slots absent by default:
+  // tail, wings
+}
+
+function BTT_tryInit(meta, text, source){
+  if(!meta) return false;
+  if(!meta.debugLog) meta.debugLog = [];
+
+  var t = String(text || "");
+  var dg = BTT_detectGenderConfidence(t);
+  var detected = (dg && dg.conf >= 0.70) ? dg.gender : null;
+  if(dg){ meta.genderConf = Math.max(0, Math.min(1, Number(dg.conf)||0)); }
+
+  // Needs init if not initialized OR anatomy is effectively empty/descriptor-only.
+  var needsInit = (!meta.__initialized) || BTT_isEffectivelyEmpty(meta);
+
+  if(needsInit){
+    // Prefer detected gender; otherwise fall back to current meta.gender; otherwise default hermaphrodite.
+    var g = (detected || meta.gender || "hermaphrodite").toLowerCase();
+
+    meta.gender = g;
+    meta.overallFem = BTT_genderBaselineFem(g);
+    // Species + appearance init/update (confidence-based, ownership-gated where possible).
+    BTT_applySpeciesInit(meta, t);
+    BTT_detectAppearanceFromText(meta, t, "INIT", true);
+    BTT_applyBaseline(meta, g, t);
+    // Decoupled appearance axes init (seed from initial prompt output)
+    BTT_appApplyFromText(meta, t, "INIT", true);
+    BTT_appApplyCanonicalSizeTraits(meta);
+
+    meta.__initialized = true;
+    // Track init turn so we can compute turns-since-refresh before the first AI refresh.
+    if(!isFinite(Number(meta._init_turn))) meta._init_turn = BTT_getTurn();
+
+    meta.debugLog.push({
+      turn: BTT_getTurn(),
+      kind: "init",
+      gender: g,
+      fem: meta.overallFem,
+      source: (source || "forced")
+    });
+
+    return true;
+  }
+
+  // Even when not (re)initializing, we update appearance/species cache from new owned descriptions.
+  BTT_applySpeciesInit(meta, t);
+  BTT_detectAppearanceFromText(meta, t, "TURN", false);
+  // Decoupled appearance axes update (runs after slot/trait system per-pass)
+  BTT_appApplyFromText(meta, t, "TURN", false);
+  BTT_appApplyCanonicalSizeTraits(meta);
+
+  return false;
+}
+
+/* ------------------------ TEXT PROCESSING ------------------------------- */
+
+function BTT_splitClauses(text){
+  var raw = String(text||"");
+  var paras = raw.split(/\n\s*\n+/g);
+
+  var out = [];
+  var idx = 0;
+
+  for(var p=0; p<paras.length; p++){
+    var chunk = String(paras[p]||"").trim();
+    if(!chunk) continue;
+
+    var parts = chunk.split(/[.!?;]+/g);
+    for(var k=0;k<parts.length;k++){
+      var s = String(parts[k]||"").trim();
+      if(!s) continue;
+      out.push({ text: s, index: idx, para: p });
+      idx++;
+    }
+  }
+  return out;
+}
+
+function BTT_word(textLower, w){
+  return new RegExp("\\b" + BTT_escapeRegExp(w) + "\\b","i").test(textLower);
+}
+
+function BTT_anyPhrase(textLower, arr){
+  for(var i=0;i<arr.length;i++){
+    var p = String(arr[i]).toLowerCase();
+    if(p && textLower.indexOf(p)!==-1) return p;
+  }
+  return null;
+}
+
+function BTT_clauseSignals(clauseLower, hasOwnershipAnchor){
+    // Hard-change matching is boundary-aware to avoid partial-word false positives.
+  var hardPat = BTT_anyPattern(clauseLower, BTT_CHANGE_HARD_PATTERNS);
+  var hardHit = hardPat ? hardPat.key : null;
+  var presHit = BTT_anyPhrase(clauseLower, BTT_CHANGE_PRESENCE);
+  var statHit = BTT_anyPhrase(clauseLower, BTT_STATUS);
+  var metaHit = BTT_anyPhrase(clauseLower, BTT_METAPHOR);
+
+  // IMPORTANT: Some hard-change words appear in world exposition (news, general warnings)
+  // without actually asserting that *the Player* is changing in this clause.
+  // We do NOT block detection (we still want failed groups to accumulate across turns),
+  // but we downshift unanchored hard-change hits into a weaker Status contribution.
+  //
+  // Anchor heuristic: if the clause contains first/second person anchors, treat hard hits as literal.
+  // Otherwise, treat them as descriptive/background (soft) so they can accumulate via inheritance
+  // without causing early commits from exposition.
+    // Ownership anchor is computed per-window (not per-clause) so exposition does not get globally upshifted.
+  var owns = !!hasOwnershipAnchor;
+
+  var hard = (hardHit && owns) ? 0.70 : 0;
+  var presence = presHit ? 0.45 : 0;
+  var status = statHit ? 0.35 : 0;
+  var unowned = 0;
+  var metaphor = metaHit ? 0.50 : 0;
+
+  var hardR = (hardHit && owns) ? [{k:hardHit, v:0.70}] : [];
+  var presenceR = presHit ? [{k:presHit, v:0.45}] : [];
+  var statusR = statHit ? [{k:statHit, v:0.35}] : [];
+  var unownedR = [];
+  var metaphorR = metaHit ? [{k:metaHit, v:0.50}] : [];
+
+  // Soft-change forms: descriptive words that can imply change without asserting an event.
+  // These contribute to Status only (reduced weight) so they can accumulate across turns if repeated.
+  var softPat = BTT_anyPattern(clauseLower, BTT_CHANGE_SOFT_PATTERNS);
+  if(softPat){
+    status += (softPat.v||0);
+    statusR.push({k:softPat.key, v:(softPat.v||0)});
+  }
+
+  // Downshift unanchored hard-change hits into Status (reduced) rather than Hard.
+  // This preserves detection while preventing immediate commits from broad exposition.
+  if(hardHit && !owns){
+    // Unowned hard-change hits: record as an "unowned" change channel.
+    // This is a downshift (not a block), and uses a lighter penalty than earlier versions.
+    // Tuned so exposition registers but does not single-pass commit new slots.
+    unowned += 0.35;
+    unownedR.push({k:hardHit, v:0.35});
+  }
+
+  // Alien sensation: weak change/status signal (not a metaphor penalty)
+  var alienSense = clauseLower.match(/\balien\s+(?:presence|sensation|feeling|touch|awareness)\b/);
+  if(alienSense){
+    status += 0.15;
+    statusR.push({k:"alien-sensation", v:0.15});
+  }
+
+  return {
+    hard: hard, presence: presence, status: status, unowned: unowned, metaphor: metaphor,
+    hardR: hardR, presenceR: presenceR, statusR: statusR, unownedR: unownedR, metaphorR: metaphorR
+  };
+}
+
+function BTT_clauseTraits(clauseLower){
+  var cl = String(clauseLower||"").toLowerCase();
+  var found = {};
+  for(var i=0;i<BTT_TRAIT_TOKENS.length;i++){
+    var t = BTT_TRAIT_TOKENS[i];
+    if(BTT_word(cl, t)) found[t.toLowerCase()] = true;
+  }
+  // Normalize synonyms: "mouth" is the same trait as "oral".
+  if(found["mouth"]){
+    found["oral"] = true;
+    delete found["mouth"];
+  }
+  // NOTE (traits vs evidence): We do NOT convert generic words like "hole"/"opening" into
+  // anatomical traits (oral/anal/vaginal). Those words are ambiguous and are handled as WEAK SLOT EVIDENCE
+  // via BTT_HOLE_EVIDENCE + window/slot resolution. Traits should come from explicit trait tokens (e.g.,
+  // anal/oral/vaginal mentioned directly) or from explicit slot-targeted phrases.
+
+  return Object.keys(found);
+}
+
+function BTT_clauseSlotEvidence(cfg, clauseLower, phraseSeen, sourceTag){
+  var cl = String(clauseLower||"").toLowerCase();
+  var slotEvidence = {};
+
+  function ensure(slot){
+    if(!slotEvidence[slot]){
+      slotEvidence[slot] = {
+        mention:0, location:0, weak:0, ownership:0,
+        mentionR:[], locationR:[], weakR:[], ownershipR:[]
+      };
+    }
+    return slotEvidence[slot];
+  }
+
+  // Phrase precedence + exclusivity:
+  // Adjacency(Location) > Ownership > Mention > Weak(minor)
+  // Longest phrases match first within each tier; matched spans are masked so sub-phrases
+  // cannot also contribute evidence (e.g., "between your legs" blocks "your legs" and "legs").
+  function maskSpan(s, start, end){
+    if(start < 0) start = 0;
+    if(end > s.length) end = s.length;
+    return s.slice(0, start) + Array(Math.max(0, end-start)+1).join(" ") + s.slice(end);
+  }
+  function findAll(s, phrase){
+    var out = [];
+    if(!phrase) return out;
+    var p = String(phrase).toLowerCase();
+    var idx = 0;
+    while(true){
+      idx = s.indexOf(p, idx);
+      if(idx === -1) break;
+      out.push({ start: idx, end: idx + p.length });
+      idx = idx + Math.max(1, p.length);
+    }
+    return out;
+  }
+
+  // Dedup (slot|phrase|channel) across the pass
+  function seenKey(slot, phrase, channel){
+    return String(slot) + "|" + String(phrase) + "|" + String(channel);
+  }
+  function canUse(slot, phrase, channel){
+    if(!phraseSeen) return true;
+    if(!phraseSeen._seen) phraseSeen._seen = {};
+    var k = seenKey(slot, phrase, channel);
+    if(phraseSeen._seen[k]) return false;
+    phraseSeen._seen[k] = true;
+    if(phraseSeen._log && phraseSeen._log.length < 200){
+      phraseSeen._log.push({slot:slot, ch:channel, phrase:phrase, src:sourceTag||""});
+    }
+    return true;
+  }
+  function maxAdd(slot, ch, amt, phrase){
+    if(!amt) return;
+    if(!canUse(slot, phrase, ch)) return;
+
+    var ev = ensure(slot);
+    if(ch==="mention"){
+      if(amt > ev.mention){ ev.mention = amt; }
+      ev.mentionR.push({k:phrase, v:amt});
+    }else if(ch==="location"){
+      if(amt > ev.location){ ev.location = amt; }
+      ev.locationR.push({k:phrase, v:amt});
+    }else if(ch==="weak"){
+      // Weak cues are intentionally additive: multiple distinct weak hits (e.g., "opening" + "hole")
+      // should reinforce confidence within the same window. Dedupe still prevents repeated identical
+      // phrase/channel contributions from inflating.
+      ev.weak = (ev.weak||0) + amt;
+      ev.weakR.push({k:phrase, v:amt});
+    }else if(ch==="ownership"){
+      if(amt > ev.ownership){ ev.ownership = amt; }
+      ev.ownershipR.push({k:phrase, v:amt});
+    }
+  }
+
+  // Working copies for masking by tier
+  var workOwn = clauseLower;
+  var workMen = clauseLower;
+  var workWeak = clauseLower;
+
+  // --- 1) LOCATION / ADJACENCY (longest first) ---
+  var locKeys = Object.keys(BTT_LOCATION_ANCHORS||{});
+  locKeys.sort(function(a,b){ return b.length - a.length; });
+  for(var li=0; li<locKeys.length; li++){
+    var key = locKeys[li];
+    if(!key) continue;
+    if(cl.indexOf(key) === -1) continue;
+
+    // Apply adjacency evidence (may target multiple slots)
+    var la = BTT_LOCATION_ANCHORS[key];
+    if(la && la.map){
+      for(var s in la.map){
+        if(!la.map.hasOwnProperty(s)) continue;
+        maxAdd(s, "location", la.map[s], key);
+      }
+    }else if(la && la.slots && typeof la.score === "number"){
+      for(var j=0;j<la.slots.length;j++){
+        maxAdd(la.slots[j], "location", la.score, key);
+      }
+    }
+
+    // Mask this phrase span in lower tiers so sub-phrases don't double count
+    var spans = findAll(workOwn, key);
+    for(var si=0; si<spans.length; si++){
+      workOwn = maskSpan(workOwn, spans[si].start, spans[si].end);
+      workMen = maskSpan(workMen, spans[si].start, spans[si].end);
+      workWeak = maskSpan(workWeak, spans[si].start, spans[si].end);
+    }
+  }
+
+  // --- 2) OWNERSHIP (mask before mention/weak) ---
+  var ownRe = /\b(your|my|his|her|their)\s+([a-z][a-z\-]*)(s)?\b/g;
+  var mOwn;
+  while((mOwn = ownRe.exec(workOwn))){
+    var full = (mOwn[1] + " " + mOwn[2] + (mOwn[3]||"")).trim();
+    var noun = mOwn[2];
+
+    for(var slot in BTT_SLOT_NOUNS){
+      if(!BTT_SLOT_NOUNS.hasOwnProperty(slot)) continue;
+      var nouns = BTT_SLOT_NOUNS[slot];
+      for(var i=0;i<nouns.length;i++){
+        if(noun === nouns[i]){
+                    // Ownership channel is reserved for Player-bound pronouns (your/my).
+          // Third-person possessives (his/her/their) are treated as mentions until entity resolution exists.
+          if(mOwn[1]==="your" || mOwn[1]==="my"){
+            maxAdd(slot, "ownership", (cfg.slotOwnership || cfg.ownership || 0.65), full);
+            // Ownership anchor for this window (used to upshift hard-change words in this window only).
+            slotEvidence.__ownAnchor = true;
+          }else{
+            maxAdd(slot, "mention", (cfg.slotMention || cfg.mention || 0.2), full);
+          }
+          break;
+        }
+      }
+    }
+
+    // Mask the ownership phrase span in mention/weak tiers
+    var st = mOwn.index;
+    var en = mOwn.index + full.length;
+    workMen = maskSpan(workMen, st, en);
+    workWeak = maskSpan(workWeak, st, en);
+  }
+
+  // --- 3) MENTION (slot nouns; longest first) ---
+  var nounPairs = [];
+  for(var slot2 in BTT_SLOT_NOUNS){
+    if(!BTT_SLOT_NOUNS.hasOwnProperty(slot2)) continue;
+    var arr = BTT_SLOT_NOUNS[slot2] || [];
+    for(var a=0;a<arr.length;a++){
+      nounPairs.push({ slot: slot2, w: String(arr[a]||"") });
+    }
+  }
+  nounPairs.sort(function(x,y){ return y.w.length - x.w.length; });
+
+  for(var np=0; np<nounPairs.length; np++){
+    var slot2 = nounPairs[np].slot;
+    var w = nounPairs[np].w;
+    if(!w) continue;
+    if(w.indexOf(" ") !== -1){
+      if(workMen.indexOf(w) === -1) continue;
+      maxAdd(slot2, "mention", (cfg.slotMention || cfg.mention || 0.2), w);
+      var spans2 = findAll(workMen, w);
+      for(var si2=0; si2<spans2.length; si2++){
+        workMen = maskSpan(workMen, spans2[si2].start, spans2[si2].end);
+        workWeak = maskSpan(workWeak, spans2[si2].start, spans2[si2].end);
+      }
+    }else{
+      var reW = new RegExp("\\b"+BTT_escapeRegExp(w)+"\\b");
+      if(reW.test(workMen)){
+        maxAdd(slot2, "mention", (cfg.slotMention || cfg.mention || 0.2), w);
+        var tokenRe = new RegExp("\\b"+BTT_escapeRegExp(w)+"\\b","g");
+        var mTok;
+        while((mTok = tokenRe.exec(workMen))){
+          var st2 = mTok.index;
+          var en2 = mTok.index + mTok[0].length;
+          workMen = maskSpan(workMen, st2, en2);
+          workWeak = maskSpan(workWeak, st2, en2);
+          tokenRe.lastIndex = st2 + 1;
+        }
+      }
+    }
+  }
+
+  // --- 4) WEAK / MINOR ---
+  // Ambiguous hole/opening cues (weak evidence to hole slots)
+  var holeKeys = Object.keys(BTT_HOLE_EVIDENCE||{});
+  holeKeys.sort(function(a,b){ return b.length - a.length; });
+  for(var hi=0; hi<holeKeys.length; hi++){
+    var hk = holeKeys[hi];
+    if(!hk) continue;
+    if(workWeak.indexOf(hk) === -1) continue;
+    var hinfo = BTT_HOLE_EVIDENCE[hk];
+    if(hinfo && hinfo.map){
+      for(var hs in hinfo.map){
+        if(!hinfo.map.hasOwnProperty(hs)) continue;
+        maxAdd(hs, "weak", hinfo.map[hs], hk);
+      }
+    }
+    var spansH = findAll(workWeak, hk);
+    for(var sh=0; sh<spansH.length; sh++){
+      workWeak = maskSpan(workWeak, spansH[sh].start, spansH[sh].end);
+    }
+  }
+
+  // Generic weak targets
+  for(var wk in BTT_WEAK_TARGETS){
+    if(!BTT_WEAK_TARGETS.hasOwnProperty(wk)) continue;
+    if(!wk) continue;
+    if(workWeak.indexOf(wk) === -1) continue;
+    var info = BTT_WEAK_TARGETS[wk];
+    if(info && info.slots && typeof info.score === "number"){
+      for(var q=0;q<info.slots.length;q++){
+        maxAdd(info.slots[q], "weak", info.score, wk);
+      }
+    }
+    var spansW = findAll(workWeak, wk);
+    for(var sw=0; sw<spansW.length; sw++){
+      workWeak = maskSpan(workWeak, spansW[sw].start, spansW[sw].end);
+    }
+  }
+
+  return slotEvidence;
+}
+
+function BTT_targetDominanceScore(slotEv){
+  var mentionW = 1.00, ownW = 1.20, locW = 0.70, weakW = 0.60;
+  return (slotEv.mention||0)*mentionW + (slotEv.ownership||0)*ownW + (slotEv.location||0)*locW + (slotEv.weak||0)*weakW;
+}
+
+function BTT_selectTargetSlot(cfg, clauseLower, slotEvidence){
+  var scores = {};
+  if(!slotEvidence) slotEvidence = {};
+
+  for(var slot in slotEvidence){
+    if(!slotEvidence.hasOwnProperty(slot)) continue;
+    var sc = BTT_targetDominanceScore(slotEvidence[slot]);
+    scores[slot] = sc;
+  }
+
+  // Pick best + runner-up
+  var bestSlot = null, bestScore = -1e9;
+  var secondSlot = null, secondScore = -1e9;
+
+  for(var s in scores){
+    if(!scores.hasOwnProperty(s)) continue;
+    var v = scores[s];
+    if(v > bestScore){
+      secondScore = bestScore; secondSlot = bestSlot;
+      bestScore = v; bestSlot = s;
+    }else if(v > secondScore){
+      secondScore = v; secondSlot = s;
+    }
+  }
+
+  return { bestSlot: bestSlot, bestScore: bestScore, secondSlot: secondSlot, secondScore: secondScore, scores: scores };
+}
+
+/* ------------------- AGGREGATION (owner+slot) --------------------------- */
+
+function BTT_emptyGroup(){
+  return {
+    // numeric channels (MUST be 0 to avoid NaN on +=)
+    hard:0,
+    presence:0,
+    status:0,
+    unowned:0,
+    metaphor:0,
+    mention:0,
+    location:0,
+    weak:0,
+    ownership:0,
+
+    // debug/reason channels
+    hardR:[],
+    presenceR:[],
+    statusR:[],
+    unownedR:[],
+    metaphorR:[],
+    mentionR:[],
+    locationR:[],
+    weakR:[],
+    ownershipR:[],
+    bindR:[],
+
+    // trait bag + seed snippets
+    traits:[],
+    winList:[],
+    snips:[],
+    seed:[], window:[]
+  };
+}
+
+function BTT_addReasons(dst, src, prefix, scale, cap){
+  if(!dst || !Array.isArray(dst)) return;
+  if(!src) return;
+
+  var arr;
+  if(Array.isArray(src)){
+    arr = src.slice(0);
+  }else if(typeof src === "object"){
+    arr = [];
+    for(var k in src){
+      if(!src.hasOwnProperty(k)) continue;
+      if(typeof src[k] === "number"){
+        arr.push({ k:k, v:src[k] });
+      }
+    }
+  }else{
+    return;
+  }
+
+  for(var i=0;i<arr.length;i++){
+    var r = arr[i];
+    if(!r || typeof r.v !== "number") continue;
+    dst.push({
+      k: (prefix ? prefix + ":" : "") + r.k,
+      v: r.v * (scale||1)
+    });
+  }
+
+  if(typeof cap === "number" && cap > 0 && dst.length > cap){
+    dst.sort(function(a,b){ return Math.abs(b.v) - Math.abs(a.v); });
+    dst.length = cap;
+  }
+}
+
+// Add a single inherited-summary reason entry for debug.
+// We intentionally DO NOT include specific words/phrases from inherited turns.
+// Instead, we tag the total inherited contribution by its source group id (e.g., "G4").
+function BTT_addInheritedSummary(dst, gid, value, cap){
+  if(!dst || !Array.isArray(dst)) return;
+  if(!gid) return;
+  var v = Number(value)||0;
+  if(!v) return;
+  dst.push({ k: "G"+gid, v: v });
+  if(typeof cap === "number" && cap > 0 && dst.length > cap){
+    dst.splice(0, dst.length - cap);
+  }
+}
+
+function BTT_addGroupEvidence(cfg, group, sig, slotEv, traits, snip, srcTag){
+  group.hard += sig.hard;
+  group.presence += sig.presence;
+  group.status += sig.status;
+  group.metaphor += sig.metaphor;
+
+  group.mention += (slotEv.mention||0);
+  group.location += (slotEv.location||0);
+  group.weak += (slotEv.weak||0);
+  group.ownership += (slotEv.ownership||0);
+
+  BTT_addReasons(group.hardR, sig.hardR, srcTag||"", 1, cfg.debug_reason_cap);
+  BTT_addReasons(group.presenceR, sig.presenceR, srcTag||"", 1, cfg.debug_reason_cap);
+  BTT_addReasons(group.statusR, sig.statusR, srcTag||"", 1, cfg.debug_reason_cap);
+  BTT_addReasons(group.metaphorR, sig.metaphorR, srcTag||"", 1, cfg.debug_reason_cap);
+
+  BTT_addReasons(group.mentionR, slotEv.mentionR, srcTag||"", 1, cfg.debug_reason_cap);
+  BTT_addReasons(group.locationR, slotEv.locationR, srcTag||"", 1, cfg.debug_reason_cap);
+  BTT_addReasons(group.weakR, slotEv.weakR, srcTag||"", 1, cfg.debug_reason_cap);
+  BTT_addReasons(group.ownershipR, slotEv.ownershipR, srcTag||"", 1, cfg.debug_reason_cap);
+
+  for(var i=0;i<traits.length;i++) group.traits[traits[i].toLowerCase()] = true;
+
+  if(snip){
+  if(group.seed && group.seed.length===0){
+    group.seed.push(String(snip));
+  }
+    group.snips.push(String(snip));
+    if(cfg.debug_clause_cap > 0 && group.snips.length > cfg.debug_clause_cap){
+      group.snips.splice(0, group.snips.length - cfg.debug_clause_cap);
+    }
+  }
+}
+
+function BTT_ownerForClause(){ return "Player"; }
+
+function BTT_aggregateText(cfg, text){
+  var clauses = BTT_splitClauses(text);
+
+  // ---- PASS 0: per-turn window bookkeeping ----
+  if(state && state.BTT){
+    state.BTT.windowCounter = 0;     // W# resets each turn
+    state.BTT.windowsThisTurn = {};  // { W#: "snippet..." }
+  }
+
+  var windows = [];
+  // De-dup windows by (paragraph,start,end) so overlapping clause-centered ranges
+  // that collapse to the same range don't create duplicate W# entries or double-count.
+  var windowsByKey = {}; // key -> index in windows
+
+  // ---- PASS 1: build candidate windows only (1–5 sentences, paragraph-bounded) ----
+  var radius = Math.max(0, Number(cfg.clause_window)||2);
+  var maxClauses = Math.max(1, Math.min(5, 1 + radius*2));
+
+  for(var i=0;i<clauses.length;i++){
+    var c = clauses[i];
+    var clause = c.text || "";
+
+    // determine start/end indices within same paragraph
+    var startIdx = i;
+    while(startIdx > 0 && clauses[startIdx-1].para === c.para && (i - startIdx) < radius){
+      startIdx--;
+    }
+    var endIdx = i;
+    while(endIdx + 1 < clauses.length && clauses[endIdx+1].para === c.para && (endIdx - startIdx + 1) < maxClauses){
+      endIdx++;
+    }
+    // enforce cap by trimming around i
+    while((endIdx - startIdx + 1) > maxClauses){
+      if((i - startIdx) > (endIdx - i)) startIdx++;
+      else endIdx--;
+    }
+
+    var parts = [];
+    for(var j=startIdx;j<=endIdx;j++) parts.push(clauses[j].text || "");
+    var windowText = parts.join(" ").replace(/\s+/g," ").trim();
+    if(!windowText) continue;
+
+    // Canonical key for this candidate window.
+    var wKey = String(c.para) + ":" + String(startIdx) + "-" + String(endIdx);
+
+    var winLowerRaw = windowText.toLowerCase();
+
+    // Slot evidence uses masking internally, but must NOT mutate raw text used for traits.
+    // NOTE: slotEvidenceWindow is computed BEFORE change signals so we can safely
+    //       condition change-word strength on a window-level ownership anchor.
+    var slotEvidenceWindow = BTT_clauseSlotEvidence(cfg, winLowerRaw);
+
+    // Signals are based on the seed clause text, traits are based on RAW window text.
+    // Ownership anchoring is evaluated at the WINDOW level (not clause level).
+    var sigSeed = BTT_clauseSignals((clause||"").toLowerCase(), !!slotEvidenceWindow.__ownAnchor);
+    var traits = BTT_clauseTraits(winLowerRaw);
+
+    // Keep if any change signal OR any slot evidence exists.
+    var changePos = (sigSeed.hard||0) + (sigSeed.presence||0) + (sigSeed.status||0) + (sigSeed.unowned||0);
+    var hasSlot = false;
+    for(var sk in slotEvidenceWindow){
+      if(!slotEvidenceWindow.hasOwnProperty(sk)) continue;
+      var ev = slotEvidenceWindow[sk];
+      var tot = (ev.mention||0) + (ev.location||0) + (ev.weak||0) + (ev.ownership||0);
+      if(tot > 0){ hasSlot = true; break; }
+    }
+    if(changePos <= 0 && !hasSlot) continue;
+
+    // If we've already created this exact paragraph-bounded window range, do NOT
+    // create a new W#; instead merge the seed-signal visibility without double counting.
+    if(windowsByKey.hasOwnProperty(wKey)){
+      var ex = windows[windowsByKey[wKey]];
+      // Keep owner stable (Player).
+      // Merge change signals by MAX so we don't inflate from duplicate windows.
+      ex.sig.hard = Math.max(ex.sig.hard||0, sigSeed.hard||0);
+      ex.sig.presence = Math.max(ex.sig.presence||0, sigSeed.presence||0);
+      ex.sig.status = Math.max(ex.sig.status||0, sigSeed.status||0);
+      ex.sig.unowned = Math.max(ex.sig.unowned||0, sigSeed.unowned||0);
+            // Metaphor is a penalty; preserve the strongest (max) penalty when merging identical windows.
+      ex.sig.metaphor = Math.max(ex.sig.metaphor||0, sigSeed.metaphor||0);
+      BTT_addReasons(ex.sig.hardR, sigSeed.hardR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(ex.sig.presenceR, sigSeed.presenceR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(ex.sig.statusR, sigSeed.statusR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(ex.sig.unownedR, sigSeed.unownedR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(ex.sig.metaphorR, sigSeed.metaphorR, "", 1, cfg.debug_reason_cap);
+      // Traits/slot evidence remain window-text-derived; they are identical for same key.
+      continue;
+    }
+
+    // Allocate W# only for kept, unique windows.
+    var wId = (state && state.BTT) ? (++state.BTT.windowCounter) : (windows.length+1);
+
+    // Store snippet (first 7 words) for debug.
+    var wWords = windowText.split(/\s+/).filter(Boolean);
+    var wSnip = wWords.slice(0,7).join(" ");
+    if(wWords.length > 7) wSnip += "…";
+    if(state && state.BTT && state.BTT.windowsThisTurn) state.BTT.windowsThisTurn[wId] = wSnip;
+
+    windowsByKey[wKey] = windows.length;
+    windows.push({
+      id: wId,
+      key: wKey,
+      owner: BTT_ownerForClause(c),
+      text: windowText,
+      lowerRaw: winLowerRaw,
+      sig: sigSeed,
+      traits: traits,
+      slotEv: slotEvidenceWindow
+    });
+  }
+
+  // ---- PASS 2: resolve windows into seeds (slot split happens here; seeds carry window ids) ----
+  var seeds = [];
+  for(var wi=0; wi<windows.length; wi++){
+    var wobj = windows[wi];
+    // NOTE: BTT_selectTargetSlot expects (cfg, clauseLower, slotEvidence).
+    // Passing only slotEvidence breaks resolution (scores empty -> no seeds -> no groups).
+    var sel = BTT_selectTargetSlot(cfg, wobj.lowerRaw, wobj.slotEv);
+    if(!sel || !sel.scores) continue;
+
+    // Sort slots by score desc
+    var pairs = [];
+    for(var sk in sel.scores){
+      if(!sel.scores.hasOwnProperty(sk)) continue;
+      var sv = Number(sel.scores[sk]) || 0;
+      if(sv > 0 && sk !== "misc") pairs.push({slot:sk, score:sv});
+    }
+    if(!pairs.length) continue;
+    pairs.sort(function(a,b){ return b.score - a.score; });
+
+    var bestScore = pairs[0].score;
+    var gap = Number(cfg.slot_dominance_gap||0.15);
+
+    // A window is an evidence span (debug provenance), not a resolved event.
+    // If multiple slots fall within slot_dominance_gap of the best slot, the *window yields multiple seeds*.
+    // Window id (W#) remains the same; only the seed's slot differs. Optional W#.N is debug-only.
+    var kept = [];
+    for(var pi=0; pi<pairs.length; pi++){
+      var p = pairs[pi];
+      if(p.score <= 0) continue;
+      if((bestScore - p.score) > gap) break;
+      kept.push(p);
+    }
+
+    var multi = (kept.length > 1);
+    for(var ki=0; ki<kept.length; ki++){
+      var p2 = kept[ki];
+      var tag = "W" + wobj.id + (multi ? ("." + (ki+1)) : "");
+
+      seeds.push({
+        owner: wobj.owner,
+        slot: p2.slot,
+        winIds: [wobj.id],
+        winTag: tag, // debug-only label (e.g., W1.2). Base id remains W1 for dedup.
+        sig: wobj.sig,
+        traits: wobj.traits,
+        slotEv: wobj.slotEv,
+        sel: sel
+      });
+    }
+  }
+
+  // ---- PASS 3: merge seeds into groups (this turn only) ----
+  var groups = {};
+  for(var si=0; si<seeds.length; si++){
+    var s = seeds[si];
+    var key = s.owner + "|" + s.slot;
+    groups[key] = groups[key] || BTT_emptyGroup();
+    var g = groups[key];
+    g.slot = s.slot;
+    g.owner = s.owner;
+
+    // Track which windows have already contributed evidence to this group.
+    // This prevents double-counting when the same W# is seen more than once.
+    g.seenWin = g.seenWin || {};
+    var primaryWid = (Array.isArray(s.winIds) && s.winIds.length) ? s.winIds[0] : null;
+
+
+    // Attach window ids for debug (this turn only; history merge does not add windows).
+    // Note: winIds are the *base* W# ids used for per-group dedup.
+    g.winIds = Array.isArray(g.winIds) ? g.winIds : [];
+    if(Array.isArray(s.winIds)){
+      for(var wj=0; wj<s.winIds.length; wj++){
+        var wid = s.winIds[wj];
+        if(g.winIds.indexOf(wid) === -1) g.winIds.push(wid);
+      }
+    }
+
+    // Optional debug-only labels for split-slot seeds from the same window (e.g., W1.1 / W1.2).
+    g.winTags = Array.isArray(g.winTags) ? g.winTags : [];
+    if(s.winTag && g.winTags.indexOf(s.winTag) === -1) g.winTags.push(s.winTag);
+
+    // Apply evidence from this window at most once per group.
+    if(primaryWid !== null && g.seenWin[primaryWid]){
+      // Already applied; keep winIds for debug, but do not add scores/reasons again.
+    } else {
+      if(primaryWid !== null) g.seenWin[primaryWid] = true;
+
+      // Merge signals: allow multiple distinct windows to reinforce change, but don't inflate
+      // slot dominance channels linearly. Change channels are additive; slot channels are MAX.
+      g.hard += (s.sig.hard||0);
+      g.presence += (s.sig.presence||0);
+      g.status += (s.sig.status||0);
+      g.metaphor += (s.sig.metaphor||0);
+      BTT_addReasons(g.hardR, s.sig.hardR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(g.presenceR, s.sig.presenceR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(g.statusR, s.sig.statusR, "", 1, cfg.debug_reason_cap);
+      BTT_addReasons(g.metaphorR, s.sig.metaphorR, "", 1, cfg.debug_reason_cap);
+
+      // Merge slot evidence for the chosen slot only (MAX per channel).
+      var ev = (s.slotEv && s.slotEv[s.slot]) ? s.slotEv[s.slot] : null;
+      if(ev){
+        g.mention = Math.max(g.mention||0, (ev.mention||0));
+        g.location = Math.max(g.location||0, (ev.location||0));
+        g.weak = Math.max(g.weak||0, (ev.weak||0));
+        g.ownership = Math.max(g.ownership||0, (ev.ownership||0));
+        BTT_addReasons(g.mentionR, ev.mentionR, "", 1, cfg.debug_reason_cap);
+        BTT_addReasons(g.locationR, ev.locationR, "", 1, cfg.debug_reason_cap);
+        BTT_addReasons(g.weakR, ev.weakR, "", 1, cfg.debug_reason_cap);
+        BTT_addReasons(g.ownershipR, ev.ownershipR, "", 1, cfg.debug_reason_cap);
+      }
+
+      // Merge traits (RAW, unmasked) once per window per group.
+      g.detectedTraits = Array.isArray(g.detectedTraits) ? g.detectedTraits : [];
+      g.traits = Array.isArray(g.traits) ? g.traits : [];
+      if(s.traits && s.traits.length){
+        for(var ti=0; ti<s.traits.length; ti++){
+          var tr = String(s.traits[ti]).toLowerCase();
+          if(g.detectedTraits.indexOf(tr)===-1) g.detectedTraits.push(tr);
+          if(g.traits.indexOf(tr)===-1) g.traits.push(tr);
+        }
+      }
+    }
+
+    // Keep first selection diagnostics
+    if(!g.sel) g.sel = s.sel;
+
+    // (traits merge moved into the per-window contribution block above)
+  }
+
+  return groups;
+}
+
+/* ------------------------- HISTORY + DECAY ------------------------------ */
+
+function BTT_pruneCaches(cfg){
+  var now = state.BTT.turnCounter;
+  var keep = cfg.retained_turns;
+  for(var owner in state.BTT.evidenceCache){
+    if(!state.BTT.evidenceCache.hasOwnProperty(owner)) continue;
+    var arr = state.BTT.evidenceCache[owner] || [];
+    arr = arr.filter(function(e){ return (now - e.turn) <= keep; });
+    state.BTT.evidenceCache[owner] = arr;
+  }
+}
+
+function BTT_mergeGroup(cfg, dst, src){
+  // Change channels can accumulate across clauses (multiple hard signals reinforce change).
+  dst.hard = (dst.hard||0) + (src.hard||0);
+  dst.presence = (dst.presence||0) + (src.presence||0);
+  dst.status = (dst.status||0) + (src.status||0);
+  dst.unowned = (dst.unowned||0) + (src.unowned||0);
+  dst.metaphor = (dst.metaphor||0) + (src.metaphor||0);
+
+  // Slot-evidence channels should NOT stack linearly across repeated mentions in nearby clauses.
+  // Use MAX to prevent "your cock" or "your thigh" inflating confidence when echoed multiple times.
+  dst.mention = Math.max((dst.mention||0), (src.mention||0));
+  dst.location = Math.max((dst.location||0), (src.location||0));
+  dst.weak = Math.max((dst.weak||0), (src.weak||0));
+  dst.ownership = Math.max((dst.ownership||0), (src.ownership||0));
+
+  BTT_addReasons(dst.hardR, src.hardR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.presenceR, src.presenceR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.statusR, src.statusR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.unownedR, src.unownedR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.metaphorR, src.metaphorR, "", 1, cfg.debug_reason_cap);
+
+  BTT_addReasons(dst.mentionR, src.mentionR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.locationR, src.locationR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.weakR, src.weakR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.ownershipR, src.ownershipR, "", 1, cfg.debug_reason_cap);
+  BTT_addReasons(dst.bindR, src.bindR, "", 1, cfg.debug_reason_cap);
+
+    // seed/window debug context: keep the first observed clause/window for this group key
+  if(src.seed && src.seed.length){
+    dst.seed = dst.seed || [];
+    if(dst.seed.length===0) dst.seed.push(src.seed[0]);
+  }
+  if(src.window && src.window.length){
+    dst.window = dst.window || [];
+    if(dst.window.length===0) dst.window.push(src.window[0]);
+  }
+  if(src.windowClauses && src.windowClauses.length){
+    dst.windowClauses = dst.windowClauses || [];
+    if(dst.windowClauses.length===0) dst.windowClauses.push(src.windowClauses[0]);
+  }
+
+  // winIds (union) — current-turn only
+  if(src.winIds && src.winIds.length){
+    dst.winIds = Array.isArray(dst.winIds) ? dst.winIds : [];
+    for(var wi=0; wi<src.winIds.length; wi++){
+      var idv = src.winIds[wi];
+      if(typeof idv !== 'number') continue;
+      if(dst.winIds.indexOf(idv)===-1) dst.winIds.push(idv);
+    }
+  }
+
+// traits (union)
+  for(var i=0;i<(src.traits||[]).length;i++){
+    var t = src.traits[i];
+    if(dst.traits.indexOf(t)===-1) dst.traits.push(t);
+  }
+
+  // Preserve originating group id / turnCreated if present.
+  if(!dst.__gid && src.__gid) dst.__gid = src.__gid;
+  if(typeof dst.turnCreated !== "number" && typeof src.turnCreated === "number") dst.turnCreated = src.turnCreated;
+}
+
+function BTT_mergeEvidence(cfg, dstObj, srcObj){
+  for(var k in srcObj.groups){
+    if(!srcObj.groups.hasOwnProperty(k)) continue;
+    dstObj.groups[k] = dstObj.groups[k] || BTT_emptyGroup();
+    BTT_mergeGroup(cfg, dstObj.groups[k], srcObj.groups[k]);
+  }
+
+  // NOTE: This function merges evidence objects by reference. If you need an
+  // immutable snapshot (for history/decay), deep-clone at the call site.
+}
+
+// Defensive deep-clone for evidence snapshots stored in state.
+// Why: AID scripting can re-enter hooks in ways that risk accidental mutation of
+// shared objects. We store immutable-by-convention snapshots so history/decay
+// always reflects what was true on the originating turn.
+function BTT_cloneEvidenceObj(obj){
+  var out = { groups: {} };
+  if(!obj || !obj.groups) return out;
+  for(var k in obj.groups){
+    if(!obj.groups.hasOwnProperty(k)) continue;
+    var g = obj.groups[k];
+    if(!g) continue;
+    // Shallow copy primitives + arrays (arrays are cloned to avoid shared refs).
+    var c = {};
+    for(var key in g){
+      if(!g.hasOwnProperty(key)) continue;
+      var v = g[key];
+      if(Array.isArray(v)) c[key] = v.slice();
+      else if(v && typeof v === 'object') {
+        // known nested arrays of strings: *_R and bindR; safe clone
+        // (avoid deep recursion; these objects are simple).
+        try{ c[key] = JSON.parse(JSON.stringify(v)); }catch(_e){ c[key] = v; }
+      } else c[key] = v;
+    }
+    out.groups[k] = c;
+  }
+  return out;
+}
+
+
+function BTT_assignGroupIds(cfg, owner, groupsObj){
+  var now = state.BTT.turnCounter;
+  if(state && state.BTT){
+    if(typeof state.BTT.globalGroupIdCounter !== "number") state.BTT.globalGroupIdCounter = 0;
+  }
+  if(groupsObj && groupsObj.groups){
+    for(var k in groupsObj.groups){
+      if(!groupsObj.groups.hasOwnProperty(k)) continue;
+      var g = groupsObj.groups[k];
+      if(!g) continue;
+      if(!g.__gid){
+        g.__gid = (state && state.BTT) ? (++state.BTT.globalGroupIdCounter) : 0;
+      }
+      if(typeof g.turnCreated !== "number") g.turnCreated = now;
+    }
+  }
+}
+
+function BTT_storeGroups(cfg, owner, groupsObj){
+  // Persist a per-turn RAW (non-inherited) snapshot for inheritance.
+  // IMPORTANT:
+  // - Call BTT_assignGroupIds(...) before this so every group has a stable __gid.
+  // - This function must NOT mutate groupsObj beyond storage; it clones defensively.
+  var arr = state.BTT.evidenceCache[owner] || [];
+  var now = state.BTT.turnCounter;
+
+  // Store a per-turn snapshot. If called multiple times in the same turn (e.g., multiple output passes),
+  // merge RAW evidence so later same-turn passes can inherit at age==0.
+  if(arr.length && arr[arr.length-1].turn === now){
+    BTT_mergeEvidence(cfg, arr[arr.length-1].evidence, BTT_cloneEvidenceObj(groupsObj));
+  } else {
+    arr.push({ turn: now, evidence: BTT_cloneEvidenceObj(groupsObj) });
+  }
+
+  state.BTT.evidenceCache[owner] = arr;
+}
+
+function BTT_combineWithHistory(cfg, owner, currentGroupsObj){
+  var now = state.BTT.turnCounter;
+  // Inheritance window (in turns). Turns increment only on input.
+  // If retained_turns = 4, then a group 1 turn old inherits at 80%, 2 turns at 60%, ...
+  // and 5 turns old is not inherited.
+  var keep = Number(cfg.retained_turns)||0;
+  var hist = state.BTT.evidenceCache[owner] || [];
+
+  var combined = { groups: {} };
+  BTT_mergeEvidence(cfg, combined, currentGroupsObj);
+
+  // Only inherit INTO groups that exist in the current turn snapshot.
+  // Rationale: prevents "history-only" groups from appearing as W:(none) and
+  // accidentally influencing commits without new evidence this turn.
+  var currentKeys = {};
+  if(currentGroupsObj && currentGroupsObj.groups){
+    for(var ck in currentGroupsObj.groups){
+      if(currentGroupsObj.groups.hasOwnProperty(ck)) currentKeys[ck] = true;
+    }
+  }
+
+  // Defensive: ensure history is processed in chronological order.
+  hist = hist.slice(0).sort(function(a,b){ return (a.turn||0) - (b.turn||0); });
+
+  for(var i=0;i<hist.length;i++){
+    var h = hist[i];
+    var age = now - h.turn;
+    if(age < 0) continue;
+    if(keep <= 0) continue;
+    if(age > keep) continue;
+    // Linear decay based on retained_turns+1 so the (keep+1)th older turn is effectively 0.
+    // Example keep=4: age1=0.8, age2=0.6, age3=0.4, age4=0.2
+    var w = (keep + 1 - age) / (keep + 1);
+    
+    for(var k in h.evidence.groups){
+      if(!h.evidence.groups.hasOwnProperty(k)) continue;
+      if(!currentKeys[k]) continue;
+      combined.groups[k] = combined.groups[k] || BTT_emptyGroup();
+      var d = combined.groups[k];
+      var s = h.evidence.groups[k];
+
+      // Same-turn multi-output inheritance guard:
+      // - Age==0 means this history snapshot is from the same turn index.
+      // - To prevent any accidental duplication cascades, only inherit from groups
+      //   with a strictly lower stable GID than the current group (when both exist).
+      if(age===0 && d && d.__gid && s && s.__gid && s.__gid >= d.__gid) continue;
+
+      d.hard += s.hard * w;
+      d.presence += s.presence * w;
+      d.status += s.status * w;
+      d.unowned += (s.unowned||0) * w;
+      // Negative inheritance banding:
+      // Metaphor is a subtractive penalty in ChangeScore. We do not allow prior-turn
+      // metaphor to reduce current-turn confirmations; inherited penalty is clamped to 0.
+      // (Net effect: metaphor is not inherited into scoring.)
+
+      d.mention += s.mention * w;
+      d.location += s.location * w;
+      d.weak += s.weak * w;
+      d.ownership += s.ownership * w;
+
+      // Inheritance debug policy: do NOT include specific phrases from history.
+      // Instead, summarize per-channel inherited totals tagged by originating group id.
+      if(s && s.__gid){
+        BTT_addInheritedSummary(d.hardR, s.__gid, (s.hard||0) * w, cfg.debug_reason_cap);
+        BTT_addInheritedSummary(d.presenceR, s.__gid, (s.presence||0) * w, cfg.debug_reason_cap);
+        BTT_addInheritedSummary(d.statusR, s.__gid, (s.status||0) * w, cfg.debug_reason_cap);
+        BTT_addInheritedSummary(d.unownedR, s.__gid, (s.unowned||0) * w, cfg.debug_reason_cap);
+        // Metaphor inheritance is intentionally omitted from scoring (see above).
+
+        BTT_addInheritedSummary(d.mentionR, s.__gid, (s.mention||0) * w, cfg.debug_reason_cap);
+        BTT_addInheritedSummary(d.locationR, s.__gid, (s.location||0) * w, cfg.debug_reason_cap);
+        BTT_addInheritedSummary(d.weakR, s.__gid, (s.weak||0) * w, cfg.debug_reason_cap);
+        BTT_addInheritedSummary(d.ownershipR, s.__gid, (s.ownership||0) * w, cfg.debug_reason_cap);
+      }
+
+      // Inherit trait candidates from prior turns (decayed evidence affects commit elsewhere).
+// Stored as arrays; union into d.traits.
+d.traits = Array.isArray(d.traits) ? d.traits : [];
+if(Array.isArray(s.traits)){
+  for(var ti2=0; ti2<s.traits.length; ti2++){
+    var tr2 = String(s.traits[ti2]||"").toLowerCase();
+    if(!tr2) continue;
+    if(d.traits.indexOf(tr2)===-1) d.traits.push(tr2);
+  }
+}else if(s.traits && typeof s.traits === "object"){
+  for(var trK in s.traits){
+    if(!s.traits.hasOwnProperty(trK)) continue;
+    var tr3 = String(trK||"").toLowerCase();
+    if(!tr3) continue;
+    if(d.traits.indexOf(tr3)===-1) d.traits.push(tr3);
+  }
+}
+    }
+  }
+
+  return combined;
+}
+
+/* ---------------------------- PROPOSALS -------------------------------- */
+
+function BTT_normalizeGroup(g){
+  if(!g) g = {};
+  g.hard = Number(g.hard) || 0;
+  g.presence = Number(g.presence) || 0;
+  g.status = Number(g.status) || 0;
+  g.unowned = Number(g.unowned) || 0;
+  g.metaphor = Number(g.metaphor) || 0;
+  g.mention = Number(g.mention) || 0;
+  g.location = Number(g.location) || 0;
+  g.weak = Number(g.weak) || 0;
+  g.ownership = Number(g.ownership) || 0;
+
+  // ensure reason arrays exist if referenced later
+  g.hardR = Array.isArray(g.hardR) ? g.hardR : [];
+  g.presenceR = Array.isArray(g.presenceR) ? g.presenceR : [];
+  g.statusR = Array.isArray(g.statusR) ? g.statusR : [];
+  g.unownedR = Array.isArray(g.unownedR) ? g.unownedR : [];
+  g.metaphorR = Array.isArray(g.metaphorR) ? g.metaphorR : [];
+  g.mentionR = Array.isArray(g.mentionR) ? g.mentionR : [];
+  g.locationR = Array.isArray(g.locationR) ? g.locationR : [];
+  g.weakR = Array.isArray(g.weakR) ? g.weakR : [];
+  g.ownershipR = Array.isArray(g.ownershipR) ? g.ownershipR : [];
+  g.bindR = Array.isArray(g.bindR) ? g.bindR : [];
+
+  g.traits = Array.isArray(g.traits) ? g.traits : [];
+  g.winIds = Array.isArray(g.winIds) ? g.winIds : [];
+  g.winList = Array.isArray(g.winList) ? g.winList : [];
+
+  g.seed = Array.isArray(g.seed) ? g.seed : [];
+  g.window = Array.isArray(g.window) ? g.window : [];
+
+  return g;
+}
+
+function BTT_changeScore(g){
+  return (Number(g && g.hard)||0) + (Number(g && g.presence)||0) + (Number(g && g.status)||0) + (Number(g && g.unowned)||0) - (Number(g && g.metaphor)||0);
+}
+function BTT_slotScore(g){
+  return (Number(g && g.mention)||0) + (Number(g && g.location)||0) + (Number(g && g.weak)||0) + (Number(g && g.ownership)||0);
+}
+
+// Effective scoring adjustments (slot-agnostic):
+// - Presence bridge: strong embodied presence can partially substitute for explicit Hard change verbs
+//   when slot evidence is confident.
+// - Metaphor scaling: metaphor penalties diminish when slot evidence is very strong (descriptive similes
+//   should not suppress clearly real anatomy).
+// These are tuning levers only; they do not favor any slot.
+function BTT_metaphorScale(cfg, slotScore){
+  var mid = (typeof cfg.metaphor_scale_slot_mid === 'number') ? cfg.metaphor_scale_slot_mid : 0.70;
+  var hi  = (typeof cfg.metaphor_scale_slot_hi  === 'number') ? cfg.metaphor_scale_slot_hi  : 0.90;
+  var midScale = (typeof cfg.metaphor_scale_mid === 'number') ? cfg.metaphor_scale_mid : 0.50;
+  var hiScale  = (typeof cfg.metaphor_scale_hi  === 'number') ? cfg.metaphor_scale_hi  : 0.25;
+  slotScore = Number(slotScore)||0;
+  if(slotScore >= hi) return hiScale;
+  if(slotScore >= mid) return midScale;
+  return 1.0;
+}
+
+function BTT_presenceBridge(cfg, g){
+  var pMin = (typeof cfg.presence_bridge_min === 'number') ? cfg.presence_bridge_min : 0.45;
+  var sMin = (typeof cfg.presence_bridge_slot_min === 'number') ? cfg.presence_bridge_slot_min : 0.75;
+  var bonus = (typeof cfg.presence_bridge_bonus === 'number') ? cfg.presence_bridge_bonus : 0.25;
+  if(!g) return 0;
+  if((Number(g.presence)||0) < pMin) return 0;
+  if((Number(g.slotScore)||0) < sMin) return 0;
+  return bonus;
+}
+
+function BTT_effectiveChangeScore(cfg, g){
+  if(!g) return 0;
+  var base = (Number(g.hard)||0) + (Number(g.presence)||0) + (Number(g.status)||0) + (Number(g.unowned)||0);
+  var ms = BTT_metaphorScale(cfg, g.slotScore);
+  var metaEff = (Number(g.metaphor)||0) * ms;
+  var bridge = BTT_presenceBridge(cfg, g);
+  // expose for debug
+  g._metaphorScale = ms;
+  g._metaphorEff = metaEff;
+  g._presenceBridge = bridge;
+  return base + bridge - metaEff;
+}
+
+function BTT_isOffslotGenitalTrait(trait){
+  trait = String(trait||"").toLowerCase();
+  return (trait==="pussy" || trait==="vagina" || trait==="vaginal" || trait==="cunt");
+}
+function BTT_isGenitalSlot(slot){
+  return (slot==="penis" || slot==="vagina" || slot==="ass" || slot==="tail");
+}
+
+// Descriptor traits are *descriptions* that commonly appear in prose.
+// We keep detecting them, but we require stronger "change context" to commit.
+// Rationale: prevents long descriptive passages from committing a dozen traits
+// when only one or two core transformation traits are intended.
+function BTT_isDescriptorTrait(trait){
+  trait = String(trait||"").toLowerCase();
+  // Keep this list intentionally small and conservative.
+  return (
+    trait==="foreign" ||
+    trait==="glistening" ||
+    trait==="prehensile" ||
+    trait==="sinuous" ||
+    trait==="slick" ||
+    trait==="velvety" ||
+    trait==="wet"
+  );
+}
+
+// Centralized trait threshold computation (used for BOTH commit decisions and debug logging).
+// Ensures descriptor thresholds and off-slot genital thresholds are consistent everywhere.
+function BTT_traitThreshold(cfg, slot, trait){
+  var thr = (cfg && typeof cfg.threshold_trait_add === 'number') ? cfg.threshold_trait_add : 0.90;
+  trait = String(trait||'').toLowerCase();
+  slot = String(slot||'').toLowerCase();
+  if(BTT_isOffslotGenitalTrait(trait) && !BTT_isGenitalSlot(slot)){
+    if(cfg && typeof cfg.threshold_offslot_genital_add === 'number') thr = cfg.threshold_offslot_genital_add;
+  }
+  if(BTT_isDescriptorTrait(trait)){
+    var dthr = (cfg && typeof cfg.threshold_descriptor_add === 'number') ? cfg.threshold_descriptor_add : 1.20;
+    if(dthr > thr) thr = dthr;
+  }
+  return thr;
+}
+
+
+// Human-readable threshold info for debug logs.
+function BTT_traitThresholdExplain(cfg, slot, trait){
+  var isGenital = (trait==="vaginal" || trait==="penile" || trait==="anal" || trait==="oral" || trait==="pussy" || trait==="cock" || trait==="dick" || trait==="cunt" || trait==="clit");
+  var isOffSlotGenital = isGenital && (slot!=="vagina" && slot!=="penis" && slot!=="ass" && slot!=="head");
+  var isDescriptor = BTT_DESCRIPTOR_TRAITS.hasOwnProperty(trait);
+  var base = (cfg && typeof cfg.threshold_trait_add === 'number') ? cfg.threshold_trait_add : 0.90;
+  if(isOffSlotGenital){
+    var t = (cfg && typeof cfg.threshold_genital_offslot_add === 'number') ? cfg.threshold_genital_offslot_add : 1.40;
+    return { thr: t, why: "offslot-genital" };
+  }
+  if(isDescriptor){
+    var d = (cfg && typeof cfg.threshold_descriptor_add === 'number') ? cfg.threshold_descriptor_add : 1.20;
+    return { thr: d, why: "descriptor" };
+  }
+  return { thr: base, why: "base" };
+}
+
+function BTT_isCupTrait(trait){
+  trait = String(trait||"").toLowerCase();
+  return (trait==="flat" || trait==="aaa" || trait==="aa" || trait==="a" || trait==="b" || trait==="c" || trait==="d" || trait==="dd" || trait==="e");
+}
+
+
+function BTT_fmtReasons(label, value, reasonsArr, cfg, forceShow){
+  var v = Number(value)||0;
+  if(!forceShow && !v) return "";
+  var arr = reasonsArr || [];
+  // Cap reasons shown for readability
+  var cap = (cfg && cfg.debug_reason_cap) ? cfg.debug_reason_cap : 12;
+  if(arr.length > cap) arr = arr.slice(0, cap);
+  if(!arr.length){
+    return label + ":" + BTT_round2(v);
+  }
+  return label + ":" + BTT_round2(v) + " [" + arr.map(function(it){
+    if(!it) return "";
+    if(typeof it === "string") return it;
+    return String(it.k||"") + ":" + BTT_round2(it.v);
+  }).filter(Boolean).join(", ") + "]";
+}
+
+function BTT_fmtReasonsArr(arr){
+  if(!arr) return "";
+
+  var a;
+  if(Array.isArray(arr)){
+    a = arr.slice(0);
+  }else if(typeof arr === "object"){
+    a = [];
+    for(var k in arr){
+      if(!arr.hasOwnProperty(k)) continue;
+      if(typeof arr[k] === "number"){
+        a.push({ k:k, v:arr[k] });
+      }
+    }
+  }else{
+    return "";
+  }
+
+  if(!a.length) return "";
+  a.sort(function(x,y){ return Math.abs(y.v) - Math.abs(x.v); });
+  return a.map(function(it){
+    var k = String(it.k||"");
+    var g = "";
+    var mm = k.match(/^(G\d+):(.+)$/);
+    if(mm){ g = " " + mm[1]; k = mm[2]; }
+    return k + ":" + BTT_round2(it.v) + g;
+  }).join(", ");
+}
+
+function BTT_groupDebugLines(groupId, slot, g, raw, thr, committed, traitsArr){
+  var lines = [];
+  lines.push("G"+groupId+" | slot="+slot+" | raw="+BTT_round2(raw)+" | thr="+BTT_round2(thr)+" | "+(committed?"PASS":"FAIL")+" | traits="+traitsArr.join(","));
+
+  if(g.snips && g.snips.length){
+    lines.push("Seed: " + g.snips.join(" | "));
+  }
+
+  var chParts = [];
+  if(g.hard) chParts.push("Hard:"+BTT_round2(g.hard)+" ["+BTT_fmtReasonsArr(g.hardR)+"]");
+  if(g.presence) chParts.push("Presence:"+BTT_round2(g.presence)+" ["+BTT_fmtReasonsArr(g.presenceR)+"]");
+  if(g.status) chParts.push("Status:"+BTT_round2(g.status)+" ["+BTT_fmtReasonsArr(g.statusR)+"]");
+  if(g.unowned) chParts.push("Unowned:"+BTT_round2(g.unowned)+" ["+BTT_fmtReasonsArr(g.unownedR)+"]");
+  if(g._presenceBridge) chParts.push("Bridge:+"+BTT_round2(g._presenceBridge));
+  if(g.metaphor){
+    var me = (typeof g._metaphorEff === 'number') ? g._metaphorEff : g.metaphor;
+    chParts.push("Metaphor:-"+BTT_round2(me)+" ["+BTT_fmtReasonsArr(g.metaphorR)+"]" + ((typeof g._metaphorScale==='number' && g._metaphorScale!==1)?(' (x'+BTT_round2(g._metaphorScale)+')'):'') );
+  }
+  var cs = (typeof g.changeScore === 'number') ? g.changeScore : BTT_changeScore(g);
+  lines.push("ChangeScore:"+BTT_round2(cs)+" | "+chParts.join(" | "));
+
+  var slParts = [];
+  if(g.bindR && g.bindR.length) slParts.push("Bind:"+g.bindR.join(", "));
+  if(g.mention) slParts.push("Mention:"+BTT_round2(g.mention)+" ["+BTT_fmtReasonsArr(g.mentionR)+"]");
+  if(g.location) slParts.push("Location:"+BTT_round2(g.location)+" ["+BTT_fmtReasonsArr(g.locationR)+"]");
+  if(g.weak) slParts.push("Weak:"+BTT_round2(g.weak)+" ["+BTT_fmtReasonsArr(g.weakR)+"]");
+  if(g.ownership) slParts.push("Ownership:"+BTT_round2(g.ownership)+" ["+BTT_fmtReasonsArr(g.ownershipR)+"]");
+  lines.push("SlotScore:"+BTT_round2(BTT_slotScore(g))+" | "+slParts.join(" | "));
+
+  return lines;
+}
+
+function BTT_ensureSlot(meta, slot){
+  if(meta.slots[slot]) return meta.slots[slot];
+  var fertility = null, virility = null;
+  if(slot==="penis") virility = 20;
+  if(slot==="vagina") fertility = 20;
+  if(slot==="ass") fertility = 0;
+  meta.slots[slot] = { traits:["human"], fertility: fertility, virility: virility, updatedTurn: 0 };
+  return meta.slots[slot];
+}
+
+function BTT_applyGroups(cfg, meta, combinedGroups){
+  var debugLines = [];
+  var keys = Object.keys(combinedGroups);
+
+  // Stable, global group ids: assigned at group creation and preserved in history.
+
+  keys.sort(function(a,b){
+    var ga = combinedGroups[a], gb = combinedGroups[b];
+    return (ga.order||0) - (gb.order||0);
+  });
+
+  for(var i=0;i<keys.length;i++){
+    var gkey = keys[i];
+    var g = BTT_normalizeGroup(combinedGroups[gkey]);
+
+    // Invalidate any cached scores that may have been computed before normalization.
+    delete g.changeScore;
+    delete g.slotScore;
+    delete g.rawScore;
+
+    // Recompute scores from normalized channels (prevents stale NaN).
+    g.slotScore = BTT_slotScore(g);
+    // Effective change score applies slot-agnostic tuning: metaphor scaling + presence bridge.
+    g.changeScore = BTT_effectiveChangeScore(cfg, g);
+    g.rawScore = g.changeScore + g.slotScore;
+
+    // Group id policy (NO allocation here):
+    // - G# is allocated once per turn-snapshot in BTT_storeGroups().
+    // - Combined groups should inherit an existing gid from current or historical evidence.
+    // - Apply/formatting passes must never increment globalGroupIdCounter (prevents G# jumping).
+    // GID may come through as a number (preferred) or as a numeric string
+    // depending on how the host environment serializes state.
+    var gid = 0;
+    if(typeof g.__gid === "number") gid = g.__gid;
+    else if(typeof g.__gid === "string" && /^\d+$/.test(g.__gid)) gid = Number(g.__gid);
+
+
+// Per-trait commit (clearer + matches your intended thresholds model).
+    var committed = [];
+    var skippedSelf = null;
+    var blocked = []; // {t, thr}
+    for(var t=0;t<g.traits.length;t++){
+      var tr = g.traits[t];
+      var thr = BTT_traitThreshold(cfg, g.slot, tr);
+
+      if(g.rawScore >= thr) committed.push(tr);
+      else blocked.push({t:tr, thr:thr});
+    }
+
+    var pass = (committed.length > 0);
+
+    // Write traits only if some pass their thresholds.
+    if(pass){
+      for(var k=0;k<committed.length;k++){
+        if(!BTT_addTrait(meta, g.slot, committed[k], cfg)){
+          skippedSelf = skippedSelf || [];
+          skippedSelf.push(committed[k]);
+        }
+      }
+    }
+
+    // Debug: headline (no trait summary here; traits are printed in dedicated sections at the bottom)
+    debugLines.push(
+      "G" + gid +
+      " | slot=" + g.slot +
+      " | raw=" + BTT_round2(g.rawScore) +
+      " | pass=" + (pass ? "YES" : "NO")
+    );
+
+    // Debug: seed windows contributing to this merged group THIS TURN (no inheritance).
+    // Windows are tracked with per-turn W# ids; ids reset each turn and increment within the turn.
+    // Windows are tracked per-turn in state.BTT.windowsThisTurn; groups store winIds (base) + optional winTags (debug-only).
+    var tags = (Array.isArray(g.winTags) && g.winTags.length) ? g.winTags.slice(0) : [];
+    var ids = (Array.isArray(g.winIds) && g.winIds.length) ? g.winIds.slice(0) : [];
+
+    // If no tags were recorded (older cached groups), fall back to base ids.
+    if(!tags.length && ids.length){
+      for(var wi=0; wi<ids.length; wi++) tags.push("W" + ids[wi]);
+    }
+
+    function parseWTag(t){
+      var m = String(t||"").match(/^W(\d+)(?:\.(\d+))?$/);
+      if(!m) return { wid: 0, sub: 0, raw: String(t||"") };
+      return { wid: Number(m[1])||0, sub: Number(m[2])||0, raw: "W"+m[1]+(m[2]?"."+m[2]:"") };
+    }
+
+    tags = tags.map(parseWTag);
+    tags.sort(function(a,b){
+      if(a.wid !== b.wid) return a.wid - b.wid;
+      return a.sub - b.sub;
+    });
+
+    if(tags.length){
+      for(var ti=0; ti<tags.length; ti++){
+        var t = tags[ti];
+        var sn = (state && state.BTT && state.BTT.windowsThisTurn) ? state.BTT.windowsThisTurn[t.wid] : "";
+        debugLines.push("  " + t.raw + ": " + (sn||""));
+      }
+    } else {
+      debugLines.push("  W: (none)");
+    }
+
+    // Remove legacy "seed:" output (seed sentences are represented by window snippets above).
+
+    // Debug: score breakdown
+    var metaEffDbg = (typeof g._metaphorEff === 'number') ? g._metaphorEff : g.metaphor;
+    var bridgeDbg = (typeof g._presenceBridge === 'number') ? g._presenceBridge : 0;
+    debugLines.push(
+      "  ChangeScore:" + BTT_round2(g.changeScore) +
+      " | " + BTT_fmtReasons("Hard", g.hard, g.hardR, cfg) +
+      " | " + BTT_fmtReasons("Presence", g.presence, g.presenceR, cfg) +
+      " | " + BTT_fmtReasons("Status", g.status, g.statusR, cfg) +
+      " | " + BTT_fmtReasons("Unowned", g.unowned, g.unownedR, cfg) +
+      (bridgeDbg>0 ? (" | Bridge:+"+BTT_round2(bridgeDbg)) : "") +
+      " | " + BTT_fmtReasons("Metaphor", -metaEffDbg, g.metaphorR, cfg, true)
+      + ((typeof g._metaphorScale==='number' && g._metaphorScale!==1)?(" (x"+BTT_round2(g._metaphorScale)+")"):"")
+    );
+    debugLines.push(
+      "  SlotScore:" + BTT_round2(g.slotScore) +
+      " | " + BTT_fmtReasons("Mention", g.mention, g.mentionR, cfg) +
+      " | " + BTT_fmtReasons("Location", g.location, g.locationR, cfg) +
+      " | " + BTT_fmtReasons("Weak", g.weak, g.weakR, cfg) +
+      " | " + BTT_fmtReasons("Ownership", g.ownership, g.ownershipR, cfg)
+    );
+
+    // Trait debug sections (always printed at bottom)
+    // Committed traits (with threshold provenance for debugging)
+var committedInfo = [];
+    for(var cti=0; cti<committed.length; cti++){
+      var ctr = committed[cti];
+      var cthr = BTT_traitThreshold(cfg, g.slot, ctr);
+      committedInfo.push(ctr + " " + BTT_round2(g.rawScore) + ">=" + BTT_round2(cthr));
+    }
+    debugLines.push("  CommittedTraits: " + (committedInfo.length ? committedInfo.join(",") : "(none)"));
+
+    // Failed traits include any detected trait that was not committed, with either rejection reason or score<threshold.
+    var detTraits = [];
+    if(g.traits && g.traits.length) detTraits = detTraits.concat(g.traits);
+    if(g.detectedTraits && g.detectedTraits.length) detTraits = detTraits.concat(g.detectedTraits);
+
+    // de-dup + sort
+    var dtSet = {};
+    for(var dti=0; dti<detTraits.length; dti++){
+      dtSet[String(detTraits[dti])] = true;
+    }
+    detTraits = Object.keys(dtSet).filter(Boolean).sort();
+
+    var failedTraits = [];
+    for(var fti=0; fti<detTraits.length; fti++){
+      var tr = detTraits[fti];
+      if(committed.indexOf(tr)!==-1) continue;
+      // NOTE: We do not special-case reject anal/oral/vaginal as 'self-slot structural traits'.
+      // If these traits appear, they should pass/fail by threshold like any other trait.
+
+      var thrF = BTT_traitThreshold(cfg, g.slot, tr);
+
+      failedTraits.push(tr + " " + BTT_round2(g.rawScore) + "<" + BTT_round2(thrF));
+    }
+
+    // Include explicit blocked traits as failures too (if any)
+    if(blocked && blocked.length){
+      for(var bti=0; bti<blocked.length; bti++){
+        var bt = blocked[bti];
+        if(!bt || !bt.t) continue;
+        var entry = bt.t + " " + BTT_round2(g.rawScore) + "<" + BTT_round2(bt.thr);
+        var already = false;
+        for(var z=0; z<failedTraits.length; z++){
+          if(failedTraits[z].indexOf(bt.t)===0){ already = true; break; }
+        }
+        if(!already) failedTraits.push(entry);
+      }
+    }
+
+    debugLines.push("  FailedTraits: " + (failedTraits.length ? failedTraits.join(", ") : "(none)"));
+  }
+
+  return debugLines;
+}
+
+// Convert raw aggregated evidence groups into proposal objects.
+// Ensures every group has: slot, traits[], rawScore, and compact debug line strings.
+// This prevents undefined/NaN failures when applying groups.
+function BTT_finalizeGroups(cfg, groupsMap){
+  var out = {};
+  for(var k in groupsMap){
+    if(!groupsMap.hasOwnProperty(k)) continue;
+    var g0 = groupsMap[k] || BTT_emptyGroup();
+
+    // Key format: "<groupId>|<slot>".
+    var parts = String(k).split("|");
+    var slot = parts.length > 1 ? parts[1] : "misc";
+    if(!slot) slot = "misc";
+
+    // Traits can be stored either as an object map (raw groups) or as an array (already-finalized).
+    var traitsArr = [];
+    if(Array.isArray(g0.traits)){
+      traitsArr = g0.traits.slice(0);
+    }else if(g0.traits && typeof g0.traits === "object"){
+      for(var tr in g0.traits){
+        if(g0.traits.hasOwnProperty(tr)) traitsArr.push(tr);
+      }
+    }
+    traitsArr.sort();
+
+    var changeScore = BTT_changeScore(g0);
+    var slotScore = BTT_slotScore(g0);
+    var raw = changeScore + slotScore;
+
+    // Compact debug line strings (no JSON in story card notes).
+    var chParts = [];
+    if(g0.hard) chParts.push("Hard:"+BTT_round2(g0.hard)+" ["+BTT_fmtReasonsArr(g0.hardR)+"]");
+    if(g0.presence) chParts.push("Presence:"+BTT_round2(g0.presence)+" ["+BTT_fmtReasonsArr(g0.presenceR)+"]");
+    if(g0.status) chParts.push("Status:"+BTT_round2(g0.status)+" ["+BTT_fmtReasonsArr(g0.statusR)+"]");
+    if(g0.unowned) chParts.push("Unowned:"+BTT_round2(g0.unowned)+" ["+BTT_fmtReasonsArr(g0.unownedR)+"]");
+    if(g0.metaphor) chParts.push("Metaphor:-"+BTT_round2(g0.metaphor)+" ["+BTT_fmtReasonsArr(g0.metaphorR)+"]");
+    var changeLine = "ChangeScore:"+BTT_round2(changeScore)+" | "+chParts.join(" | ");
+
+    var slParts = [];
+    if(g0.bindR && g0.bindR.length) slParts.push("Bind:"+g0.bindR.join(", "));
+    if(g0.mention) slParts.push("Mention:"+BTT_round2(g0.mention)+" ["+BTT_fmtReasonsArr(g0.mentionR)+"]");
+    if(g0.location) slParts.push("Location:"+BTT_round2(g0.location)+" ["+BTT_fmtReasonsArr(g0.locationR)+"]");
+    if(g0.weak) slParts.push("Weak:"+BTT_round2(g0.weak)+" ["+BTT_fmtReasonsArr(g0.weakR)+"]");
+    if(g0.ownership) slParts.push("Ownership:"+BTT_round2(g0.ownership)+" ["+BTT_fmtReasonsArr(g0.ownershipR)+"]");
+    var slotLine = "SlotScore:"+BTT_round2(slotScore)+" | "+slParts.join(" | ");
+
+    out[k] = {
+      slot: slot,
+      traits: traitsArr,
+      detectedTraits: (g0.detectedTraits && g0.detectedTraits.length ? g0.detectedTraits.slice(0, cfg.debug_trait_cap||16) : []),
+      winIds: (g0.winIds && g0.winIds.length ? g0.winIds.slice(0) : []),
+      winTags: (g0.winTags && g0.winTags.length ? g0.winTags.slice(0) : []),
+      __gid: (typeof g0.__gid === 'number' ? g0.__gid : null),
+      turnCreated: (typeof g0.turnCreated === 'number' ? g0.turnCreated : null),
+      // Preserve reason arrays for debug (instrumentation; no scoring impact)
+      hardR: (g0.hardR && g0.hardR.length ? g0.hardR.slice(0, cfg.debug_reason_cap||12) : []),
+      presenceR: (g0.presenceR && g0.presenceR.length ? g0.presenceR.slice(0, cfg.debug_reason_cap||12) : []),
+      statusR: (g0.statusR && g0.statusR.length ? g0.statusR.slice(0, cfg.debug_reason_cap||12) : []),
+      metaphorR: (g0.metaphorR && g0.metaphorR.length ? g0.metaphorR.slice(0, cfg.debug_reason_cap||12) : []),
+      mentionR: (g0.mentionR && g0.mentionR.length ? g0.mentionR.slice(0, cfg.debug_reason_cap||12) : []),
+      locationR: (g0.locationR && g0.locationR.length ? g0.locationR.slice(0, cfg.debug_reason_cap||12) : []),
+      weakR: (g0.weakR && g0.weakR.length ? g0.weakR.slice(0, cfg.debug_reason_cap||12) : []),
+      ownershipR: (g0.ownershipR && g0.ownershipR.length ? g0.ownershipR.slice(0, cfg.debug_reason_cap||12) : []),
+      bindR: (g0.bindR && g0.bindR.length ? g0.bindR.slice(0, cfg.debug_reason_cap||12) : []),
+
+      seed: (g0.seed && g0.seed.length ? g0.seed.slice(0, cfg.debug_seed_cap||2) : []),
+      window: (g0.window && g0.window.length ? g0.window.slice(0, cfg.debug_window_cap||3) : []),
+      windowClauses: (g0.windowClauses && g0.windowClauses.length ? g0.windowClauses.slice(0, cfg.debug_window_cap||3) : []),
+      sel: (g0.sel ? g0.sel : null),
+      rawScore: raw,
+      // Keep the underlying channels for threshold selection/debugging.
+      hard: g0.hard, presence: g0.presence, status: g0.status, metaphor: g0.metaphor,
+      mention: g0.mention, location: g0.location, weak: g0.weak, ownership: g0.ownership,
+      change: { line: changeLine },
+      slotEv: { line: slotLine }
+    };
+  }
+  return out;
+}
+
+/* ------------------------- CONTEXT INJECTION ---------------------------- */
+
+function BTT_markRecent(entity, slots){
+  if(!state.BTT.recent[entity]) state.BTT.recent[entity] = {};
+  var ttl = 3;
+  for(var i=0;i<slots.length;i++) state.BTT.recent[entity][slots[i]] = ttl;
+}
+function BTT_decayRecent(){
+  for(var ent in state.BTT.recent){
+    if(!state.BTT.recent.hasOwnProperty(ent)) continue;
+    var m = state.BTT.recent[ent];
+    for(var slot in m){
+      if(!m.hasOwnProperty(slot)) continue;
+      m[slot]--;
+      if(m[slot] <= 0) delete m[slot];
+    }
+  }
+}
+
+function BTT_buildContextBlock(cfg, entity, meta){
+  var label = (entity==="Player") ? "PLAYER" : entity.slice(4).toUpperCase();
+  var lines = [];
+
+  var include = {};
+  if(cfg.context_mode === "full"){
+    include = null;
+  } else {
+    if(cfg.excerpt_always_include_genitals){
+      ["penis","vagina","ass","breasts"].forEach(function(s){ include[s]=true; });
+    }
+    var rec = state.BTT.recent[entity] || {};
+    for(var s2 in rec) if(rec.hasOwnProperty(s2)) include[s2]=true;
+  }
+
+  lines.push(label + (cfg.context_mode==="full" ? " ANATOMY (BTT)" : " ANATOMY (BTT Excerpt)"));
+  lines.push("");
+
+  for(var i=0;i<BTT_SLOTS.length;i++){
+    var slot = BTT_SLOTS[i];
+    if(slot==="misc") continue;
+    if(include && !include[slot]) continue;
+
+    var s = meta.slots[slot];
+    if(!s){
+      if(cfg.context_mode==="full") lines.push(slot.toUpperCase() + ": none");
+      continue;
+    }
+    var rhs = (s.traits && s.traits.length) ? s.traits.join("; ") : "human";
+    if(slot==="penis" && typeof s.virility==="number") rhs += "; virility " + Math.max(0, Math.min(100, s.virility));
+    if(typeof s.fertility==="number") rhs += "; fertility " + Math.max(0, Math.min(100, s.fertility));
+    lines.push(slot.toUpperCase() + ": " + rhs);
+  }
+
+  lines.push("");
+  lines.push("Femininity (overall): " + Math.max(-100, Math.min(100, Number(meta.overallFem)||0)));
+  return "\n\n" + lines.join("\n") + "\n\n";
+}
+
+/* ------------------------------ HOOKS ---------------------------------- */
+
+function onInput_BTT(text){
+  BTT_ensureState();
+  var cfg = BTT_getConfig();
+  if(!cfg.enabled) return text;
+
+  // Always attempt to load entity and write something, even if errors occur.
+  var meta = null;
+  var debugLines = [];
+  try{
+    // Reset per-turn window ids for debug (W#)
+    state.BTT.windowCounter = 0;
+    
+    state.BTT.windowsThisTurn = {};
+BTT_pruneCaches(cfg);
+
+    // Reset per-pass phrase dedup tracker
+    if(state && state.BTT) state.BTT.phraseSeen = { _seen:{}, _log:[] };
+    state.BTT.seedCounter = 0;
+
+    meta = BTT_loadEntity("Player");
+
+    // FORCE init as early as possible on input (won't harm if output also inits)
+    var initDid = BTT_tryInit(meta, text, "input");
+
+    // Debug: confirm appearance detection/evidence capture ran
+    if(meta.appearance && meta.appearance.evidence && meta.appearance.evidence.length){
+      debugLines.push("APPEARANCE DETECT | fields=" + Object.keys(meta.appearance.fields||{}).join(", "));
+    }
+
+    var groups = BTT_aggregateText(cfg, text);
+    var currentObj = { groups: groups };
+
+    // Allocate stable group ids for this pass (does NOT store; storage occurs after apply).
+    // This allows same-turn inheritance from earlier outputs without self-inheriting this pass.
+    BTT_assignGroupIds(cfg, "Player", currentObj);
+
+    var combined = BTT_combineWithHistory(cfg, "Player", currentObj);
+
+    combined.groups = BTT_finalizeGroups(cfg, combined.groups);
+    debugLines = BTT_applyGroups(cfg, meta, combined.groups) || [];
+
+    // Decoupled appearance update after slot system (input pass can contain initial appearance prose)
+    BTT_appApplyFromText(meta, text, "INPUT", false);
+    // -----------------------------------------------------------------------
+    // Appearance refresh scheduling (STATE-driven, after scan)
+    // -----------------------------------------------------------------------
+    // If user input contains strong appearance-relevant changes, we can schedule
+    // a refresh so the NEXT model output turn writes a tagged appearance block.
+    try{
+      if(cfg && cfg.appearance_refresh_enabled !== false){
+        state.BTT.appearanceGen = state.BTT.appearanceGen || { pending:false, awaiting:false, lastRequestTurn:-999, didInit:false, lastRefreshTurn:-999, deltaSinceRefresh:0, _ctxInjectedTurn:-999 };
+        if(!state.BTT.appearanceGen.awaiting){
+          var _needIn = false;
+          // Only schedule from input if we already have an AI appearance summary; otherwise output init will handle it.
+          var _hasAIIn = false;
+          try{ _hasAIIn = !!(meta && meta.appearance && String(meta.appearance.summary_ai||"").trim()); }catch(_eHasIn){}
+          if(_hasAIIn && BTT_shouldRefreshAppearance(cfg, meta)) _needIn = true;
+
+          var _tNowIn = BTT_getTurn();
+          if(_needIn && state.BTT.appearanceGen.lastRequestTurn === _tNowIn) _needIn = false;
+
+          if(_needIn){
+            state.BTT.appearanceGen.pending = true;
+            state.BTT.appearanceGen.awaiting = true;
+            state.BTT.appearanceGen.lastRequestTurn = _tNowIn;
+            state.BTT.appearanceGen._ctxInjectedTurn = -999;
+
+
+            // Freeze the appearance-generation prompt at trigger time so it is not overwritten
+            // during retry loops. Store it and publish to the TEMP instruction card.
+            try{
+              state.BTT.appearanceGen.promptText = BTT_buildAppearanceGenerationPrompt(cfg, meta, String((state.BTT && state.BTT.lastStoryText) || \"\"));
+              BTT_setAppearanceGenCardText(state.BTT.appearanceGen.promptText);
+            }catch(_ePT){}
+            meta.appearance = meta.appearance || {};
+            meta.appearance._pendingRefresh = true;
+            meta.appearance._need_ai_refresh = true;
+          }
+        }
+      }
+    }catch(_eRschIn){}
+
+
+    // Store RAW (non-inherited) current-pass groups into history for future inheritance.
+    BTT_storeGroups(cfg, "Player", currentObj);
+
+
+    var recentSlots = {};
+    for(var k in groups){
+      if(!groups.hasOwnProperty(k)) continue;
+      var slot = k.split("|")[1];
+      recentSlots[slot] = true;
+    }
+    BTT_markRecent("Player", Object.keys(recentSlots));
+
+    if(initDid){
+      debugLines.unshift("INIT | gender=" + meta.gender + " | fem=" + meta.overallFem + " | src=input");
+    }
+  }catch(e){
+    // Surface errors into the Story Card Notes so they don't silently break the run.
+    debugLines = debugLines || [];
+    var msg = (e && e.message) ? e.message : String(e);
+    debugLines.unshift("BTT ERROR (input): " + msg);
+  }
+
+  // Always write anatomy + debug if possible
+  try{
+    if(!meta) meta = BTT_loadEntity("Player");
+    BTT_writeEntity("Player", meta, debugLines, cfg);
+  }catch(_e){}
+
+  return text;
+}
+
+function onContext_BTT(text){
+  BTT_ensureState();
+  var cfg = BTT_getConfig();
+  if(!cfg.enabled) return text;
+
+  try{
+    BTT_decayRecent();
+
+    var meta = BTT_loadEntity("Player");
+    meta.appearance = meta.appearance || {};
+    if(!state.BTT.appearanceGen) state.BTT.appearanceGen = { pending:false, awaiting:false, lastRequestTurn:-999, didInit:false, lastRefreshTurn:-999, deltaSinceRefresh:0, _ctxInjectedTurn:-999 };
+
+    // ---------------------------------------------------------------------
+    // APPEARANCE GEN MODE (AC-style, idempotent context)
+    // ---------------------------------------------------------------------
+    // IMPORTANT: Never "save and restore" raw context strings.
+    // Instead, when awaiting an AI-authored appearance paragraph, we simply
+    // append the generation prompt to the normal context every turn until the
+    // tagged block is captured on output. This mirrors Auto-Cards behavior and
+    // prevents post-continue context drift / prompt stacking.
+    if(state.BTT.appearanceGen.awaiting){
+      // In excerpt context mode, appended text can be truncated away.
+      // Instead of appending the prompt into raw context, we write it into a TEMP
+      // story card so it reliably survives and remains last-authority.
+      // IMPORTANT: We do NOT rebuild the prompt every turn; the prompt is frozen
+      // at trigger time in state.BTT.appearanceGen.promptText to avoid drift.
+      try{
+        var ptxt = String((state.BTT.appearanceGen && state.BTT.appearanceGen.promptText) || "");
+        if(!ptxt){
+          // Defensive: if missing, rebuild once from current meta.
+          ptxt = BTT_buildAppearanceGenerationPrompt(cfg, meta, String((state.BTT && state.BTT.lastStoryText) || ""));
+          state.BTT.appearanceGen.promptText = ptxt;
+        }
+        BTT_setAppearanceGenCardText(ptxt);
+      }catch(_eGC){}
+
+      var ctxGen = BTT_buildContextBlock(cfg, "Player", meta) + String(text||"");
+      return ctxGen;
+    }
+
+
+    var ctx =var ctx = BTT_buildContextBlock(cfg, "Player", meta) + String(text||"");
+    return ctx;
+  }catch(_e){}
+
+  return text;
+}
+
+/* ============================================================================
+   PUBLIC ROUTER
+   --------------------------------------------------------------------------
+   Usage in Adventure/Scenario tabs (mirrors InnerSelf style):
+
+     // Input tab
+     BTT("input");
+     const modifier = (text) => ({ text });
+     modifier(text);
+
+     // Context tab
+     BTT("context");
+     const modifier = (text) => ({ text });
+     modifier(text);
+
+     // Output tab
+     BTT("output");
+     const modifier = (text) => ({ text });
+     modifier(text);
+
+   This keeps BTT fully isolated from InnerSelf/AutoCards triggers while still
+   allowing BTT to request hidden tagged blocks and parse them on output.
+============================================================================ */
+
+function BTT(phase){
+  try{
+    phase = String(phase||"").toLowerCase();
+    if(phase === "input"){
+      text = onInput_BTT(text);
+    } else if(phase === "context"){
+      text = onContext_BTT(text);
+    } else if(phase === "output"){
+      text = onOutput_BTT(text);
+    }
+  } catch(err){
+    try{
+      var which = (phase === "input" || phase === "output" || phase === "context") ? phase : "unknown";
+      state.message = "BTT ERROR (" + which + "): " + (err && err.message ? err.message : String(err));
+    } catch(e2){ /* ignore */ }
+  }
+}
+
+function onOutput_BTT(text){
+  BTT_ensureState();
+  var cfg = BTT_getConfig();
+  if(!cfg.enabled) return text;
+
+  var meta = null;
+  var debugLines = [];
+
+  try{
+    // Turn counter increments on OUTPUT (one visible model response).
+    // NOTE: When we are in AC/IS-style appearance generation mode, the output is a
+    // maintenance turn that should NOT count as an in-story turn (otherwise
+    // "Turns since refresh" jumps to 1 immediately).
+    var _bttIsGenMode = false;
+    try{ _bttIsGenMode = !!(state && state.BTT && state.BTT.appearanceGen && state.BTT.appearanceGen.awaiting); }catch(_eGM){}
+    if(!_bttIsGenMode){
+      state.BTT.turnCounter = (state.BTT.turnCounter||0) + 1;
+    }
+    // Reset per-turn window id counter for clean W# provenance.
+    state.BTT.windowCounter = 0;
+
+    // Reset per-pass phrase dedup tracker
+    if(state && state.BTT) state.BTT.phraseSeen = { _seen:{}, _log:[] };
+
+    meta = BTT_loadEntity("Player");
+
+    // -----------------------------------------------------------------------
+    // Appearance prose generation mode (AC/IS-style):
+    // If the previous CONTEXT pass requested a dedicated appearance generation,
+    // capture this output as the new appearance paragraph and suppress it from
+    // the visible story stream.
+    // -----------------------------------------------------------------------
+    if(state && state.BTT && state.BTT.appearanceGen && state.BTT.appearanceGen.awaiting){
+      // Idempotency: if output hook is invoked multiple times, avoid stacking Continue prompts.
+      if(String(text||"").indexOf(">>> please select \"continue\"") === 0){
+        return text;
+      }
+      var rawOut = String(text||"");
+
+      // STRICT CAPTURE POLICY (requested):
+      // - Only accept content between <<BTT_APPEARANCE_REFRESH>> tags.
+      // - If tags are missing, DO NOT clear awaiting state.
+      // - Always suppress visible output and force a Continue until capture succeeds.
+      var cap = BTT_extractAppearanceRefresh(rawOut);
+      var prose = (cap && cap.prose) ? String(cap.prose||"").trim() : "";
+
+      if(prose){
+        meta.appearance = meta.appearance || {};
+        meta.appearance.summary_ai = prose;
+        meta.appearance._did_ai_init = true;
+        meta.appearance._pendingRefresh = false;
+        meta.appearance._need_ai_refresh = false;
+        meta.appearance.lastRefreshTurn = state.BTT.turnCounter;
+        meta.appearance._delta_since_refresh = 0;
+        meta.appearance._last_refresh_turn = state.BTT.turnCounter;
+
+        debugLines.push("APPEARANCE REFRESH (AI GEN MODE) | stored to card");
+
+        try{
+          if(state && state.BTT && state.BTT.appearanceGen){
+            state.BTT.appearanceGen.didInit = true;
+            state.BTT.appearanceGen.lastRefreshTurn = state.BTT.turnCounter;
+            state.BTT.appearanceGen.deltaSinceRefresh = 0;
+            state.BTT.appearanceGen.pending = false;
+            state.BTT.appearanceGen.awaiting = false;
+            state.BTT.appearanceGen.promptText = "";
+            try{ BTT_clearAppearanceGenCard(); }catch(_eC){}
+          }
+        }catch(_eS){}
+      }else{
+        // Tags missing or empty => keep awaiting and retry next turn.
+        debugLines.push("APPEARANCE REFRESH (AI GEN MODE) | MISSING TAGS (retrying)");
+        try{
+          var _pt = String((state.BTT.appearanceGen && state.BTT.appearanceGen.promptText) || "");
+          if(_pt) BTT_setAppearanceGenCardText(_pt);
+        }catch(_ePT3){}
+      }
+
+      // Write cards now (notes include debug), but NEVER allow this maintenance output into story.
+      try{ BTT_writeEntity("Player", meta, debugLines, cfg); }catch(_e){}
+      try{ state.message = prose ? "BTT: Appearance card refreshed." : "BTT: Appearance refresh pending (Continue)."; }catch(_e2){}
+      var _bttContinueMsg = ">>> please select \"continue\" (100%) <<<\n\n";
+      return _bttContinueMsg;
+    }
+
+
+    // Safety: if we are not awaiting appearance generation, ensure the TEMP instruction card is blank.
+    try{
+      if(!(state && state.BTT && state.BTT.appearanceGen && state.BTT.appearanceGen.awaiting)){
+        BTT_clearAppearanceGenCard();
+      }
+    }catch(_eClr){}
+
+
+
+    // Capture and strip any AI-authored appearance refresh prose.
+    var ap = BTT_extractAppearanceRefresh(String(text||""));
+    if(ap && ap.prose){
+      meta.appearance = meta.appearance || {};
+      meta.appearance.summary_ai = ap.prose;
+      meta.appearance._did_ai_init = true;
+      meta.appearance._pendingRefresh = false;
+      meta.appearance._need_ai_refresh = false;
+      meta.appearance.lastRefreshTurn = state.BTT.turnCounter;
+      // Reset refresh accumulation.
+      meta.appearance._delta_since_refresh = 0;
+      meta.appearance._last_refresh_turn = state.BTT.turnCounter;
+      text = ap.cleaned;
+      debugLines.push("APPEARANCE REFRESH (AI) | stored to card");
+      try{ if(state && state.BTT && state.BTT.appearanceGen){ state.BTT.appearanceGen.didInit = true; state.BTT.appearanceGen.lastRefreshTurn = state.BTT.turnCounter; state.BTT.appearanceGen.deltaSinceRefresh = 0; } }catch(_eS2){}
+    }
+
+    // FORCE init as early as possible on output (scenario text is usually here)
+    var initDid = BTT_tryInit(meta, text, "output");
+
+    // Debug: confirm appearance detection/evidence capture ran
+    if(meta.appearance && meta.appearance.evidence && meta.appearance.evidence.length){
+      debugLines.push("APPEARANCE DETECT | fields=" + Object.keys(meta.appearance.fields||{}).join(", "));
+    }
+
+    var groups = BTT_aggregateText(cfg, text);
+    var currentObj = { groups: groups };
+
+    // Allocate stable group ids for this pass (does NOT store; storage occurs after apply).
+    // This allows same-turn inheritance from earlier outputs without self-inheriting this pass.
+    BTT_assignGroupIds(cfg, "Player", currentObj);
+
+    var combined = BTT_combineWithHistory(cfg, "Player", currentObj);
+
+    combined.groups = BTT_finalizeGroups(cfg, combined.groups);
+    debugLines = debugLines.concat(BTT_applyGroups(cfg, meta, combined.groups) || []);
+
+    // Decoupled appearance update after slot system (output is the primary narrative source)
+    BTT_appApplyFromText(meta, text, "OUTPUT", false);
+    // -----------------------------------------------------------------------
+    // Appearance refresh scheduling (STATE-driven, after scan)
+    // -----------------------------------------------------------------------
+    // We decide whether to request an AI-authored appearance refresh ONLY AFTER
+    // we have scanned the relevant input/output text and updated appearance axes.
+    // This ensures the injected refresh context includes the latest axes snapshot.
+    try{
+      if(cfg && cfg.appearance_refresh_enabled !== false){
+        state.BTT.appearanceGen = state.BTT.appearanceGen || { pending:false, awaiting:false, lastRequestTurn:-999, didInit:false, lastRefreshTurn:-999, deltaSinceRefresh:0, _ctxInjectedTurn:-999 };
+        if(!state.BTT.appearanceGen.awaiting){
+          var _need = false;
+          var _hasAI = false;
+          try{ _hasAI = !!(meta && meta.appearance && String(meta.appearance.summary_ai||"").trim()); }catch(_eHas2){}
+          if(!_hasAI) _need = true;
+          else if(state.BTT.appearanceGen.didInit !== true) _need = true;
+          else if(BTT_shouldRefreshAppearance(cfg, meta)) _need = true;
+
+          // Guard: do not request more than once per story turn.
+          var _tNow = BTT_getTurn();
+          if(_need && state.BTT.appearanceGen.lastRequestTurn === _tNow) _need = false;
+
+          if(_need){
+            state.BTT.appearanceGen.pending = true;
+            state.BTT.appearanceGen.awaiting = true;
+            state.BTT.appearanceGen.lastRequestTurn = _tNow;
+            // Allow context hook to inject on the NEXT context build.
+            state.BTT.appearanceGen._ctxInjectedTurn = -999;
+
+
+            // Freeze the appearance-generation prompt at trigger time so it is not overwritten
+            // during retry loops. Store it and publish to the TEMP instruction card.
+            try{
+              state.BTT.appearanceGen.promptText = BTT_buildAppearanceGenerationPrompt(cfg, meta, String((state.BTT && state.BTT.lastStoryText) || \"\"));
+              BTT_setAppearanceGenCardText(state.BTT.appearanceGen.promptText);
+            }catch(_ePT2){}
+            meta.appearance = meta.appearance || {};
+            meta.appearance._pendingRefresh = true;
+            meta.appearance._need_ai_refresh = true;
+          }
+        }
+      }
+    }catch(_eRsch){}
+
+
+    // Store RAW (non-inherited) current-pass groups into history for future inheritance.
+    BTT_storeGroups(cfg, "Player", currentObj);
+
+    var recentSlots = {};
+    for(var k in groups){
+      if(!groups.hasOwnProperty(k)) continue;
+      var slot = k.split("|")[1];
+      recentSlots[slot] = true;
+    }
+    BTT_markRecent("Player", Object.keys(recentSlots));
+
+    if(initDid){
+      debugLines.unshift("INIT | gender=" + meta.gender + " | fem=" + meta.overallFem + " | src=output");
+    }
+  }catch(e){
+    debugLines = debugLines || [];
+    var msg = (e && e.message) ? e.message : String(e);
+    debugLines.unshift("BTT ERROR (output): " + msg);
+  }
+
+  try{
+    if(!meta) meta = BTT_loadEntity("Player");
+    BTT_writeEntity("Player", meta, debugLines, cfg);
+  }catch(_e){}
+
+  
+  // Cache last visible story output (used as a style reference for appearance generation).
+  try{
+    state.BTT = state.BTT || {};
+    state.BTT.lastStoryText = String(text||"").slice(-1200);
+  }catch(_e){}
+return text;
+}
+
+/* ============================================================================
+   END BTT — v2.48
+============================================================================ */

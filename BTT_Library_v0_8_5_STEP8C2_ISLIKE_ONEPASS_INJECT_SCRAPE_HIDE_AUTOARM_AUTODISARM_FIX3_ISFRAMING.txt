@@ -1,0 +1,368 @@
+/*
+BTT Library — Step 8C2 (IS/Auto-Cards Likeness: One-Pass Inject/Scrape/Hide; Minimal/Stable)
+File: BTT_Library_v0_8_5_STEP8C2_ISLIKE_ONEPASS_INJECT_SCRAPE_HIDE_AUTOARM_AUTODISARM_FIX2.txt
+
+WHY THIS EXISTS
+- The stop/continue “task replacement” methodology can trigger AI Dungeon’s opaque “action processing failed internally”.
+- This Step 8C2 variant mirrors the Inner Self/Auto-Cards pattern more closely:
+    (1) CONTEXT appends a small instruction payload (does NOT replace the prompt; does NOT set stop)
+    (2) OUTPUT scrapes <BTT_META>...</BTT_META> from the same response and removes it from visible output
+    (3) Gate resets to false only after a successful scrape
+
+IMPORTANT SAFETY / COMPATIBILITY
+- ES5 only (no modern operators, no template literals, no multiline string literals)
+- No reliance on `state`
+- No reliance on external libraries
+
+EXPECTED I/C/O (UNCHANGED)
+Input:
+  BTT("input");
+  const modifier = (text) => ({ text });
+  modifier(text);
+
+Context:
+  BTT("context");
+  const modifier = (text) => ({ text, stop });
+  modifier(text);
+
+Output:
+  BTT("output");
+  const modifier = (text) => ({ text });
+  modifier(text);
+*/
+
+// AID sometimes references `stop` in Context even if not declared.
+if (typeof stop === "undefined") { var stop = false; }
+
+(function(){
+  // --- Global handle (stable across AID isolated-vm environments) ---
+  var BTT_G = (typeof globalThis !== "undefined") ? globalThis : (typeof window !== "undefined" ? window : this);
+
+  // ------------------------------
+  // Story card helpers (Auto-Cards-like)
+  // ------------------------------
+  function hasStoryCards() {
+    try { return (typeof storyCards !== "undefined") && Array.isArray(storyCards); }
+    catch (e) { return false; }
+  }
+  function hasAddStoryCard() {
+    try { return (typeof addStoryCard === "function"); }
+    catch (e) { return false; }
+  }
+
+  function constructCard(templateCard, insertionIndex) {
+    if (!hasStoryCards() || !hasAddStoryCard()) return null;
+    try { addStoryCard("%@%"); } catch (e) { return null; }
+
+    for (var i = 0; i < storyCards.length; i++) {
+      var card = storyCards[i];
+      try {
+        if (!card || card.title !== "%@%") continue;
+
+        card.type = String(templateCard.type || "");
+        card.title = String(templateCard.title || "");
+        card.keys = String(templateCard.keys || "");
+        card.entry = String(templateCard.entry || "");
+        card.description = String(templateCard.description || "");
+
+        var ins = (typeof insertionIndex === "number") ? insertionIndex : 0;
+        if (i !== ins) {
+          storyCards.splice(i, 1);
+          storyCards.splice(ins, 0, card);
+        }
+        return card;
+      } catch (e2) {}
+    }
+    return null;
+  }
+
+  function findCardIndexByTitle(title) {
+    if (!hasStoryCards()) return -1;
+    for (var i = 0; i < storyCards.length; i++) {
+      try {
+        if (storyCards[i] && storyCards[i].title === title) return i;
+      } catch (e) {}
+    }
+    return -1;
+  }
+
+  function getOrCreateCardByTitle(title, templateDefaults) {
+    if (!hasStoryCards()) return null;
+    var idx = findCardIndexByTitle(title);
+    if (idx >= 0) return storyCards[idx];
+
+    var tpl = {
+      type: "story",
+      title: String(title || ""),
+      keys: "",
+      entry: "",
+      description: ""
+    };
+
+    if (templateDefaults) {
+      try {
+        if (typeof templateDefaults.type === "string") tpl.type = templateDefaults.type;
+        if (typeof templateDefaults.title === "string") tpl.title = templateDefaults.title;
+        if (typeof templateDefaults.keys === "string") tpl.keys = templateDefaults.keys;
+        if (typeof templateDefaults.entry === "string") tpl.entry = templateDefaults.entry;
+        if (typeof templateDefaults.description === "string") tpl.description = templateDefaults.description;
+      } catch (e) {}
+    }
+
+    return constructCard(tpl, 0);
+  }
+
+  function forceUpdateCard(title, fields) {
+    if (!hasStoryCards()) return false;
+    var c = getOrCreateCardByTitle(title, fields);
+    if (!c) return false;
+
+    try {
+      if (typeof fields.type === "string") c.type = fields.type;
+      if (typeof fields.title === "string") c.title = fields.title;
+      if (typeof fields.keys === "string") c.keys = fields.keys;
+      if (typeof fields.entry === "string") c.entry = fields.entry;
+      if (typeof fields.description === "string") c.description = fields.description;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ------------------------------
+  // Flags (BTT FLAGS story card)
+  // ------------------------------
+  var FLAGS_TITLE = "BTT FLAGS";
+
+  function ensureRequiredCards() {
+    // Create only if missing. Do not overwrite existing content.
+    getOrCreateCardByTitle(FLAGS_TITLE, {
+      type: "story",
+      title: FLAGS_TITLE,
+      keys: "btt,flags",
+      entry: "BTT FLAGS\n\narmed_step8C2: true\ntaskPending_step8C2: false\n",
+      description: "Internal control flags for BTT libraries. Edit only if you know what you are doing."
+    });
+
+    getOrCreateCardByTitle("BTT DEBUG (STEP 8C2)", {
+      type: "story",
+      title: "BTT DEBUG (STEP 8C2)",
+      keys: "btt,debug,step8C2",
+      entry: "BTT DEBUG (STEP 8C2)\n",
+      description: "Step 8C2 debug status."
+    });
+
+    getOrCreateCardByTitle("BTT TASK OUTPUT (RAW)", {
+      type: "story",
+      title: "BTT TASK OUTPUT (RAW)",
+      keys: "btt,debug,task,raw",
+      entry: "BTT TASK OUTPUT (RAW)\n",
+      description: "Raw model output captured during the one-pass inject/scrape test (Step 8C2)."
+    });
+
+    getOrCreateCardByTitle("BTT SCRAPED META (STEP 8C2)", {
+      type: "story",
+      title: "BTT SCRAPED META (STEP 8C2)",
+      keys: "btt,debug,meta,scrape",
+      entry: "BTT SCRAPED META (STEP 8C2)\n",
+      description: "Structured meta block scraped from the model output (Step 8C2 one-pass)."
+    });
+  }
+
+  function readFlagsEntry() {
+    if (!hasStoryCards()) return "";
+    var c = getOrCreateCardByTitle(FLAGS_TITLE);
+    if (!c) return "";
+    return String(c.entry || "");
+  }
+
+  function writeFlagsEntry(newEntry) {
+    forceUpdateCard(FLAGS_TITLE, {
+      type: "story",
+      title: FLAGS_TITLE,
+      keys: "btt,flags",
+      entry: String(newEntry || ""),
+      description: "Internal control flags for BTT libraries. Edit only if you know what you are doing."
+    });
+  }
+
+  function getFlagsKV(key) {
+    var entry = readFlagsEntry();
+    var re = new RegExp("(^|\\n)" + key.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&") + "\\s*:\\s*([^\\n]*)", "m");
+    var m = entry.match(re);
+    if (!m) return "";
+    return String(m[2] || "").replace(/^\s+|\s+$/g, "");
+  }
+
+  function setFlagsKV(key, value) {
+    var entry = readFlagsEntry();
+    var k = key;
+    var v = String(value);
+
+    if (entry.indexOf(k + ":") < 0) {
+      // Append new key
+      if (entry.length && entry.charAt(entry.length - 1) !== "\n") entry += "\n";
+      entry += k + ": " + v + "\n";
+      writeFlagsEntry(entry);
+      return;
+    }
+
+    // Replace existing key line
+    var re = new RegExp("(^|\\n)(" + k.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&") + "\\s*:\\s*)([^\\n]*)", "g");
+    entry = entry.replace(re, function(full, p1, p2){
+      return p1 + p2 + v;
+    });
+    writeFlagsEntry(entry);
+  }
+
+  // Auto-arm only if missing
+  function ensureAutoArmDefault() {
+    var cur = getFlagsKV("armed_step8C2");
+    if (cur === "") setFlagsKV("armed_step8C2", "true");
+    var pend = getFlagsKV("taskPending_step8C2");
+    if (pend === "") setFlagsKV("taskPending_step8C2", "false");
+  }
+
+  function isArmed() {
+    return String(getFlagsKV("armed_step8C2")).toLowerCase() === "true";
+  }
+  function isPending() {
+    return String(getFlagsKV("taskPending_step8C2")).toLowerCase() === "true";
+  }
+
+  // ------------------------------
+  // Inject / Scrape
+  // ------------------------------
+  function buildInjectionPrompt() {
+    // Mirror Inner Self framing: use >>> ... <<< wrapper, only our inner block differs.
+    return [
+      "\n>>> BTT (hidden system payload; do not show) >>>",
+      "<BTT_META>",
+      "test_marker: BTT_TEST_ECHO_92731",
+      "</BTT_META>",
+      "<<< BTT (end hidden payload) <<<"
+    ].join("\n");
+  }
+  function extractMetaBlock(raw) {
+    var s = String(raw || "");
+    var open = "<BTT_META>";
+    var close = "</BTT_META>";
+    var i = s.indexOf(open);
+    if (i < 0) return "";
+    var j = s.indexOf(close, i + open.length);
+    if (j < 0) return "";
+    return s.slice(i, j + close.length).replace(/^\s+|\s+$/g, "");
+  }
+
+  function removeFirstMetaBlock(raw) {
+    var s = String(raw || "");
+    var open = "<BTT_META>";
+    var close = "</BTT_META>";
+    var i = s.indexOf(open);
+    if (i < 0) return s;
+    var j = s.indexOf(close, i + open.length);
+    if (j < 0) return s;
+    var end = j + close.length;
+    return s.slice(0, i) + s.slice(end);
+  }
+
+  function writeDebugStatus(armed, pending, note) {
+    var lines = [
+      "BTT DEBUG (STEP 8C2)",
+      "",
+      "armed: " + (armed ? "true" : "false"),
+      "pending: " + (pending ? "true" : "false")
+    ];
+    if (note) lines.push(String(note));
+
+    forceUpdateCard("BTT DEBUG (STEP 8C2)", {
+      type: "story",
+      title: "BTT DEBUG (STEP 8C2)",
+      keys: "btt,debug,step8C2",
+      entry: lines.join("\n") + "\n",
+      description: "Step 8C2 debug status."
+    });
+  }
+
+  // ------------------------------
+  // Public hook: BTT("input"|"context"|"output")
+  // ------------------------------
+  if (typeof BTT_G.BTT === "undefined") {
+    BTT_G.BTT = function(hook) {
+      // `text` is provided by AID; do not redeclare.
+      if (typeof text !== "string") return;
+
+      // Card creation is safest in context/output; avoid doing it in input.
+      if (hook === "context" || hook === "output") {
+        ensureRequiredCards();
+        ensureAutoArmDefault();
+      }
+
+      if (hook === "context") {
+        if (!isArmed()) {
+          writeDebugStatus(false, isPending(), "(not armed; no injection)" );
+          return;
+        }
+
+        // Mark pending so OUTPUT knows to scrape/hide once.
+        if (!isPending()) setFlagsKV("taskPending_step8C2", "true");
+
+        // Append (do NOT replace) the injection prompt.
+        text = String(text || "") + "\n\n" + buildInjectionPrompt();
+
+        writeDebugStatus(true, true, "(injected one-pass payload)" );
+        return;
+      }
+
+      if (hook === "output") {
+        if (!isPending()) return;
+
+        var raw = String(text || "");
+
+        // Always capture raw for debugging.
+        forceUpdateCard("BTT TASK OUTPUT (RAW)", {
+          type: "story",
+          title: "BTT TASK OUTPUT (RAW)",
+          keys: "btt,debug,task,raw",
+          entry: [
+            "BTT TASK OUTPUT (RAW)",
+            "",
+            "(step 8C2 one-pass)",
+            "",
+            raw
+          ].join("\n"),
+          description: "Raw model output captured during the one-pass inject/scrape test (Step 8C2)."
+        });
+
+        var meta = extractMetaBlock(raw);
+
+        forceUpdateCard("BTT SCRAPED META (STEP 8C2)", {
+          type: "story",
+          title: "BTT SCRAPED META (STEP 8C2)",
+          keys: "btt,debug,meta,scrape",
+          entry: [
+            "BTT SCRAPED META (STEP 8C2)",
+            "",
+            (meta ? meta : "(meta block not found)")
+          ].join("\n"),
+          description: "Structured meta block scraped from the model output (Step 8C2 one-pass)."
+        });
+
+        // Only on success do we disarm + clear pending, and hide the block from visible output.
+        if (meta) {
+          text = removeFirstMetaBlock(raw);
+          setFlagsKV("taskPending_step8C2", "false");
+          setFlagsKV("armed_step8C2", "false");
+          writeDebugStatus(false, false, "(success; scraped + hid meta; auto-disarmed)" );
+        } else {
+          // Leave pending on so you can see repeated attempts if desired.
+          writeDebugStatus(isArmed(), true, "(pending; meta not found in output)" );
+        }
+
+        return;
+      }
+
+      return;
+    };
+  }
+})();
