@@ -1,0 +1,166 @@
+BTT 2.0 DEVELOPABLE RISK GUIDE
+==============================
+
+PURPOSE
+-------
+A Developable Risk describes a progression that can be acquired from world evidence
+and then advanced through repeated qualifying events. It is separate from the
+Instant-Change risk_tracks embedded in Gender/Heritage/product profiles.
+
+MINIMAL CREATOR CARD
+--------------------
+Example Risk
+ALIASES: example adaptation
+
+ACQUIRE 1: repeated exposure to an enchanted training field
+DELIVERY: exposure, repeated-exposure
+QUALIFIERS: training field, repeated exposure
+ACQUIRE THRESHOLD: 2.25
+ACQUIRE HISTORY: 5
+
+TRACK: Adaptive Response
+TRIGGERS: repeated training-field exposure, field reacts to the wearer
+DELIVERY: exposure, repeated-exposure
+TRACK THRESHOLD: 2.2
+CHANCE: 10
+REPEAT: 10
+MAX: 70
+MEMORY: 10
+SUCCESS 1: HEAD +trigger-sensitive
+
+PERSISTENCE: acquired
+REMOVAL: source dispelled, adaptation cleansed
+
+ACQUISITION FIELDS
+------------------
+ACQUIRE N: <semantic prototype>
+  Starts an acquisition path. Multiple ACQUIRE sections are supported.
+
+DELIVERY: <delivery-id, delivery-id>
+  Delivery evidence expected for the current acquisition or current track.
+
+QUALIFIERS: <phrase, phrase>
+  Additional semantic phrases that strengthen the intended match.
+
+SOURCE TRAITS: trait, trait
+SOURCE SLOT TRAITS: trait, trait
+SOURCE HERITAGE: heritage-id, heritage-id
+SOURCE PROFILE(S): profile-id, profile-id
+SOURCE CONDITIONS: condition, condition
+  Optional source constraints.
+
+RECEIVER TRAITS: trait, trait
+RECEIVER CONDITIONS: condition, condition
+  Optional receiver constraints.
+
+EXCLUDE TRAITS: trait, trait
+EXCLUDE HERITAGE: heritage-id, heritage-id
+EXCLUDE RISKS: risk-id, risk-id
+  Optional exclusion gates.
+
+ACQUIRE SLOT: head|arms|legs|breasts|gut|penis|vagina|ass|tail|wings
+SLOT ORIGIN: heritage-or-origin-id
+NATURAL TRAITS: trait, trait
+ACQUIRE AXES: fem +1; height =20
+ACQUIRE CONDITIONS: condition, condition
+  Optional phenotype/state changes applied when the risk is acquired.
+
+ACQUIRE THRESHOLD: number
+ACQUIRE HISTORY: turns
+  Confidence threshold and historical corroboration window for acquisition.
+
+TRACK FIELDS
+------------
+TRACK: <track name>
+TRIGGERS: phrase, phrase
+DELIVERY / TRACK DELIVERY: delivery-id, delivery-id
+QUALIFIERS / TRACK QUALIFIERS: phrase, phrase
+SOURCE SLOT TRAITS: trait, trait
+RECEIVER ROUTING: slot -> trait + trait; slot -> trait
+TRACK THRESHOLD: number
+CHANCE: 0-100
+REPEAT: 0-100
+MAX: 0-100
+MEMORY: turns
+
+CHANCE is the starting success chance once an event clears the track evidence
+threshold. REPEAT increases the chance after qualifying misses, up to MAX. MEMORY
+controls how long track exposure state remains relevant.
+
+SUCCESS GRAMMAR
+---------------
+A SUCCESS line may contain one or more semicolon-separated outcomes.
+
+Trait outcome:
+  SUCCESS 1: HEAD +obedient
+  SUCCESS 2: TAIL +prehensile
+  SUCCESS 2: BREASTS -sensitive
+
+Axis outcome:
+  SUCCESS 1: AXIS fem +1
+  SUCCESS 2: AXIS height =20
+
+Condition outcome:
+  SUCCESS 1: CONDITION +infection
+  SUCCESS 2: CONDITION -infection
+
+Persistent trigger outcome:
+  SUCCESS 1: TRIGGER +field-response: reacts automatically to the training field
+
+Multiple outcomes:
+  SUCCESS 2: AXIS breast_size +1; AXIS ass_size +1
+
+Mental/behavioral traits are routed to HEAD by BTT's semantic outcome resolver during
+AI authoring. AI-generated outcome magnitudes use script-owned balancing defaults
+where the engine can resolve the effect itself.
+
+LIFECYCLE
+---------
+PERSISTENCE: acquired
+  The normal generated/creator card default. The risk remains acquired until a
+  removal event qualifies.
+
+REMOVAL: phrase, phrase
+  Semantic removal events recognized by the runtime.
+
+CREATOR-AUTHORED VS AI-GENERATED
+--------------------------------
+Creator-authored cards:
+- are parsed and executed normally;
+- are never automatically rewritten by AI Developable Risk authoring;
+- can still show diagnostic Progression Watch evidence.
+
+AI-generated cards contain:
+  AI-GENERATED: true
+
+When optional AI generation is enabled, BTT can:
+- author a new basic risk after parent recurrence/readiness qualifies;
+- replay retained events through the normal acquisition/track runtime;
+- watch acquired generated risks for independently corroborated progression;
+- append a higher SUCCESS level to an existing track;
+- append a genuinely new TRACK when a separate progression family independently
+  clears the same recurrence/confidence requirements.
+
+When extending an AI-generated risk, BTT does not re-author its name, acquisitions,
+existing tracks, or lifecycle. A new track requests only the new track name, triggers,
+outcome semantics, and delivery only when delivery cannot be resolved locally.
+No newly authored SUCCESS is applied retroactively.
+
+AI DISCOVERY / AUTHORING MODEL
+------------------------------
+AI discovery is disabled by default. When enabled, the engine separates:
+- canonical event admission;
+- affected owner;
+- trigger actor;
+- causal source/mechanism;
+- response channels;
+- parent risk hypothesis;
+- track hypotheses;
+- authoring readiness;
+- ordinary post-authoring acquisition/progression.
+
+Weak but real events can count toward recurrence without independently satisfying the
+final authoring-confidence threshold. Parent topics remain active without per-event
+confidence decay. After the configured inactivity horizon, a parent compacts into one
+dormant historical seed at 50% of current authoring confidence and can later be
+revived by fresh compatible evidence.

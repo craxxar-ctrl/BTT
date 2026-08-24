@@ -1,0 +1,128 @@
+BTT 2.0 CREATOR GUIDE
+=====================
+
+1. START WITH THE RUNTIME
+-------------------------
+Install BTT2.0_RC1.txt as one complete Library script. Call BTT("input"),
+BTT("context"), and BTT("output") from the corresponding AI Dungeon script tabs.
+Do not split or truncate the library.
+
+BTT will create a Configure BTT card and BTT NPC Targets card when story-card access
+is available. Settings are read from the Configure BTT Notes/Description field.
+
+2. DEFINE THE SCENARIO'S PROFILE SPACE
+--------------------------------------
+BTT Gender and BTT Heritage cards define which canonical profiles are available to
+that scenario. Include only profiles that are intended to exist in the setting.
+Species is represented through Heritage rather than through an independent species
+transformation list.
+
+The distribution includes the standard Gender set:
+  Male
+  Female
+  Femboy
+  Mascgirl
+  Tomboy
+  Hermaphrodite
+  Futanari
+  Dickgirl
+  Cuntboy
+
+and the standard Human Heritage profile.
+
+Add scenario-specific Heritage cards as needed. A prose mention alone does not make
+an unavailable Heritage profile canonical.
+
+3. ADMIT NPCS DELIBERATELY
+--------------------------
+BTT tracks the Player automatically.
+
+NPCs can be admitted in either of two ways:
+- a Character story card whose title is the character's proper name; or
+- the character's proper name listed in the BTT NPC Targets Notes/Description field.
+
+BTT NPC Targets is permission, not proof. The engine still resolves identity/body
+and event evidence before creating or changing that NPC's state.
+
+4. CHARACTER-CARD BASELINES
+----------------------------
+Character cards may include explicit creator metadata:
+  baseline_gender = male
+  baseline_heritage = human
+
+BTT can also import stable representable physical details from Character cards, such
+as hair/eye/skin descriptions, build, cup size, and explicit penis length. Character
+card prose is treated as baseline information rather than as a transformation event.
+
+5. UNDERSTAND THE FOUR BTT-MANAGED ENTITY CARDS
+-----------------------------------------------
+Each initialized Player/NPC owns four cards:
+
+Anatomy BTT
+  Canonical identity, per-slot anatomy/traits, active Conditions, overall femininity,
+  and relevant debug information.
+
+Appearance BTT
+  Structured appearance axes/fields. Player cards may also contain the captured
+  AI-authored appearance paragraph. NPC appearance remains structured-only.
+
+Instant-Change BTT
+  Temporary/permanent Instant-Change lifecycle, reversion snapshot, Instant-Change
+  risk state, Developable Risk state, and machine payload.
+
+AI-Facing BTT
+  Concise projection of canonical identity/anatomy/appearance for narrative context.
+  NPC AI-Facing cards receive identity aliases as triggers; source/debug cards do not.
+
+Manual edits to managed source cards are imported during the next preflight pass.
+BTT then serializes canonical state back through one writer.
+
+6. DEVELOPABLE RISKS
+--------------------
+Creator-authored Developable Risks are ordinary BTT story cards and are the preferred
+way to define important planned progression systems. See DEVELOPABLE_RISK_GUIDE.txt.
+
+The optional AI-authoring subsystem can discover non-standard repeated-exposure risks
+that were not pre-authored. It is disabled by default. When enabled, it:
+- collects actual owner-bound response/change events;
+- resolves parent source/mechanism hypotheses with confidence scoring;
+- waits for recurrence and authoring-readiness confidence;
+- asks the AI only for unresolved semantic wording;
+- compiles creator-card grammar and balancing values itself;
+- replays retained evidence through the normal Developable Risk runtime;
+- keeps acquired generated risks under Progression Watch;
+- may add higher SUCCESS levels or independently qualified new tracks to AI-generated
+  cards only.
+
+Creator-authored Developable Risk cards remain immutable to this subsystem.
+
+7. INSTANT-CHANGE PROFILES
+--------------------------
+Gender/Heritage profiles may also contain Instant-Change detection, duration,
+duration modifiers, permanence/reversion rules, and Instant-Change risk_tracks.
+These Instant-Change risk_tracks are a different subsystem from BTT Developable Risk
+cards; do not mix the two grammars.
+
+8. APPEARANCE REFRESH
+---------------------
+Player appearance prose can be refreshed through a tagged metadata operation when
+appearance_refresh_enabled is true and the configured refresh conditions are met.
+The task asks the model for:
+  (player_appearance = `<1-4 concise appearance sentences>`)
+
+BTT strips the metadata operation from visible story output and stores the prose.
+NPCs never request AI appearance refreshes.
+
+9. RELEASE-SAFE CREATOR WORKFLOW
+--------------------------------
+Recommended order for a scenario release:
+1. Install/freeze the BTT runtime version.
+2. Add the standard Gender profiles.
+3. Add only scenario-valid Heritage profiles.
+4. Set Character-card baseline metadata where useful.
+5. Add creator-authored Developable Risks that are part of intended scenario design.
+6. Configure BTT settings.
+7. Add explicit NPC targets only where needed.
+8. Run a fresh scenario test and inspect the four BTT cards plus debug output.
+9. Enable AI Developable Risk generation only if the scenario benefits from emergent
+   non-standard progression systems.

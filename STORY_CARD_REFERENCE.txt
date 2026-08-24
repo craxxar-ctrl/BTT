@@ -1,0 +1,120 @@
+BTT 2.0 STORY CARD REFERENCE
+============================
+
+CONTROL CARDS
+-------------
+Configure BTT
+  Type: Config
+  Created/normalized automatically.
+  Settings belong in Notes/Description. Entry is intentionally kept short.
+  Unknown setting names are ignored.
+
+BTT NPC Targets
+  Type: Config
+  Created/normalized automatically.
+  Notes/Description: comma-separated proper names of NPCs BTT is allowed to track.
+  Character story cards are separately eligible without listing the name here.
+
+BTT AI Dev Risk Generation Debug
+  Type: BTT Debug
+  Created only when dev_risk_ai_debug_card_enabled is true.
+  Diagnostic card for optional AI Developable Risk discovery/authoring.
+
+PROFILE CARDS
+-------------
+BTT Gender / BTT Genders
+  Recognized when type/cardType/title/keys contains BTT Gender or BTT Genders.
+  Can be written as JSON or the human-readable field format.
+
+BTT Heritage
+  Recognized when type/cardType/title/keys contains BTT Heritage.
+  Can be written as JSON or the human-readable field format.
+
+Human-readable profile fields accepted by the parser include:
+  <Profile Name>                 first non-field line
+  ALIASES: a, b, c
+  ENABLED: true|false
+  INIT DETECTION ENABLED: true|false
+  MANUFACTURER / MAKER / BRAND: text
+  KNOCKOFF: true|false
+  PRONOUNS: he/him/his, she/her/her, they/them/their
+  TARGET GENDER: profile-id
+
+  HEAD: marker, trait, trait
+  ARMS: marker, trait
+  LEGS: marker, trait
+  BREASTS: marker, trait
+  GUT: marker, trait
+  PENIS: marker, trait
+  VAGINA: marker, trait
+  ASS: marker, trait
+  TAIL: marker, trait
+  WINGS: marker, trait
+  OVERALL: marker
+
+  HERITAGE TRAIT(S): comma-separated traits
+  GENDER TRAIT(S): comma-separated traits
+  AXES: height: 19-21, fem: +(45-55), breast_size: =0, ...
+
+  SKIN: [options]
+  HAIR COLOR: [options]
+  HAIR LENGTH: [options]
+  EYE COLOR: [options]
+  BUILD: [options]
+  SCENT: [options]
+
+Instant-Change/profile fields also accepted:
+  INSTANT CHANGE DETECTION: phrase, phrase
+  SWAP MODE: value
+  SWAP STRENGTH: number
+  DURATION / TIMED: days or range
+  DURATION MODIFIERS: Basic = 1 day; Strong = 30 days
+  EXTEND TIME CONDITIONS: phrase: +days
+  REDUCE TIME TRIGGERS: phrase: -days
+  PERMANENCY TRIGGERS: phrase, phrase
+  REVERSION TARGET: profile/target
+  OPPOSITE ALIASES: alias, alias
+  REVERSAL: true|false
+  REVERSAL DETECTION: phrase, phrase
+  RISK TRACKS JSON: JSON array/object for Instant-Change risk tracks
+
+PROFILE AXIS GRAMMAR
+--------------------
+19-21       absolute random roll in range
+-10-10      absolute random roll spanning negative to positive
++(14-24)    add a rolled magnitude
+-(45-55)    subtract a rolled magnitude
+=(35-55)    replace with a rolled value
++12 / -8    scalar addition/subtraction
+=0 / 20     scalar replacement
+
+MANAGED ENTITY CARDS
+--------------------
+Every initialized entity owns exactly four BTT-managed cards:
+  Anatomy BTT
+  Appearance BTT
+  Instant-Change BTT
+  AI-Facing BTT
+
+Their entity/role identity is stored in Notes/Description using internal markers.
+Creators should not duplicate these cards. Manual edits to supported source fields are
+read during preflight; BTT later rewrites the canonical representation.
+
+CHARACTER CARDS
+---------------
+Non-BTT story cards whose type includes Character are eligible NPC baseline sources.
+The title must be a proper-name-shaped character name.
+
+Optional explicit metadata:
+  baseline_gender = <gender-profile-id>
+  baseline_heritage = <heritage-profile-id>
+
+Keys that are proper names may become aliases. Lowercase role/occupation keywords do
+not become identity aliases.
+
+DEVELOPABLE RISK CARDS
+----------------------
+Type: BTT Developable Risk (or Developable Risk)
+Title convention: BTT Dev Risk - <name>
+Content may be in value or Entry. If both contain identical text, BTT parses it once.
+See DEVELOPABLE_RISK_GUIDE.txt for the complete grammar.

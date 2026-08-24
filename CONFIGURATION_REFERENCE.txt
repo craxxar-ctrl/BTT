@@ -1,0 +1,253 @@
+BTT 2.0 CONFIGURATION REFERENCE
+===============================
+
+Configure BTT stores settings in the card Notes/Description field. The script
+starts from the defaults below and overrides only recognized `key: value` lines. Lines
+may include trailing # comments. Unknown keys are ignored. Boolean values use true/false.
+
+The defaults listed here are taken from the BTT 2.0 RC1 runtime. AI Developable
+Risk generation and its dedicated debug card are deliberately disabled by default.
+
+CORE / CONTEXT
+--------------
+enabled: true
+  Master switch for BTT runtime processing.
+context_mode: excerpt
+  Player context projection: excerpt or full. Any other value normalizes to excerpt.
+excerpt_always_include_genitals: true
+  In excerpt context, always include penis/vagina slot lines even when empty.
+
+CONDITION/REPRODUCTIVE SCOPE
+----------------------------
+fertility_scope_vaginal: true
+  Allows vaginal reproductive events to participate in Condition logic.
+fertility_scope_anal: false
+  Allows anal scope where supported by Condition logic.
+fertility_scope_oral: false
+  Allows oral scope where supported by Condition logic.
+
+APPEARANCE REFRESH
+------------------
+appearance_refresh_enabled: true
+  Enables tagged AI appearance refreshes for the Player. NPC refreshes remain disabled.
+appearance_refresh_turns: 6
+  Minimum turn spacing used by Player appearance refresh scheduling.
+appearance_refresh_delta: 10
+  Accumulated structured appearance delta required for a normal refresh.
+appearance_refresh_force_init: true
+  Allows initial Player appearance prose to be requested even before later delta thresholds.
+
+PRONOUNS
+--------
+pronoun_policy: hybrid
+  Pronoun policy; hybrid uses body/femininity evidence while fixed uses gender defaults.
+pronoun_they_band: 19
+  Absolute femininity band around zero where hybrid policy may choose they/them.
+pronoun_switch_on_vagina: true
+  Hybrid policy may prefer she/her when vagina is present and penis absent.
+pronoun_switch_on_penis: true
+  Hybrid policy may prefer he/him when penis is present and vagina absent.
+pronoun_grace_turns: 2
+  Turns for previous-pronoun continuity after a committed pronoun change.
+
+EVIDENCE RETENTION / NARRATIVE WINDOW
+-------------------------------------
+retained_turns: 4
+  General evidence/history retention window for short-lived observations.
+decay_base: 0.65
+  Base decay multiplier used by ordinary retained evidence histories.
+dosed_container_expiration_turns: 12
+  Turns before unresolved dosed-container evidence expires.
+dosed_container_revival_grace_turns: 12
+  Additional grace for reconnecting previously recognized dosed-container evidence.
+clause_window: 3
+  Maximum adjacent-fragment window used by bounded contextual evidence borrowing.
+
+SLOT/OWNER EVIDENCE
+-------------------
+slotMention: 0.3
+  Evidence contribution from explicit slot/body-part mention.
+slotOwnership: 0.25
+  Evidence contribution from owner-bound slot resolution.
+slotLocation: 0.14
+  Evidence contribution from anatomical location phrases.
+slotWeak: 0.06
+  Weak fallback slot evidence contribution.
+target_min: 0.28
+  Minimum target/owner evidence used by generalized routing.
+slot_bind_min: 0.45
+  Minimum confidence for binding an observation to an anatomy slot.
+slot_dominance_gap: 0.18
+  Required separation between winning and next-best slot candidates.
+tail_spine_appendage_bonus: 0.25
+  Extra tail confidence for spine/appendage evidence.
+tail_from_ass_bonus: 0.35
+  Extra tail confidence for ass/tail-origin contextual evidence.
+ass_container_penalty: 0.2
+  Penalty used to keep ass-container language from overclaiming anatomy ownership.
+
+ANATOMY TRAIT COMMIT THRESHOLDS
+-------------------------------
+threshold_trait_add: 0.9
+  Confidence required to add an anatomy trait.
+threshold_trait_remove: 1.1
+  Confidence required to remove an anatomy trait.
+threshold_offslot_genital_add: 1.4
+  Higher threshold for genital traits proposed away from their normal slot.
+threshold_descriptor_add: 1.2
+  Confidence required to commit descriptive anatomy traits.
+misc_threshold_add: 1
+  Confidence required to commit traits to the misc slot.
+
+AXIS EVIDENCE
+-------------
+axis_evidence_threshold: 0.78
+  Confidence required to commit an appearance-axis change.
+axis_evidence_store_min: 0.5
+  Minimum axis evidence retained for possible corroboration.
+axis_history_bonus_max: 0.35
+  Maximum historical corroboration bonus for axis evidence.
+
+CONDITION EVIDENCE
+------------------
+condition_event_threshold: 2.3
+  Total confidence required to commit a Condition event.
+condition_event_store_min: 1.55
+  Minimum Condition event evidence retained for corroboration.
+condition_history_bonus_max: 0.6
+  Maximum historical corroboration bonus for Conditions.
+condition_actuality_min: 0.55
+  Minimum actuality confidence for a Condition event.
+condition_completion_floor: 0.35
+  Minimum completion/occurrence evidence for immediate Condition events.
+condition_state_min: 0.7
+  Minimum state evidence used by Condition classification.
+condition_source_min: 0.58
+  Minimum source confidence for Conditions that require a source.
+condition_receiver_min: 0.62
+  Minimum receiver confidence for Condition commits.
+
+DEVELOPABLE RISK RUNTIME
+------------------------
+dev_risk_enabled: true
+  Master switch for creator-authored/generated Developable Risk runtime.
+dev_risk_assumption_narrowness: 0.6
+  How closely narrative events must match creator acquisition/trigger semantics; 0 broad, 1 narrow.
+dev_risk_acquire_threshold: 2.25
+  Confidence required to acquire a Developable Risk.
+dev_risk_acquire_store_min: 1.55
+  Minimum acquisition evidence retained for corroboration.
+dev_risk_acquire_history_bonus_max: 0.55
+  Maximum historical acquisition corroboration bonus.
+dev_risk_acquire_history_turns: 5
+  Acquisition history window in turns.
+dev_risk_track_threshold: 2.2
+  Evidence threshold required before a track can roll.
+dev_risk_default_base_chance: 10
+  Default CHANCE compiled into AI-generated tracks.
+dev_risk_default_repeat_increase: 10
+  Default REPEAT increase compiled into AI-generated tracks.
+dev_risk_default_maximum_chance: 70
+  Default MAX compiled into AI-generated tracks.
+dev_risk_default_memory_turns: 10
+  Default MEMORY compiled into AI-generated tracks.
+
+AI DEVELOPABLE RISK GENERATION
+------------------------------
+dev_risk_ai_generation_enabled: false
+  Enables optional AI discovery/authoring. OFF by default.
+dev_risk_ai_generation_cooldown_turns: 15
+  Minimum turns between successful generated-profile/extension authoring events.
+dev_risk_ai_min_confidence: 2.65
+  Parent authoring-readiness threshold; also used by generated-profile progression qualification.
+dev_risk_ai_min_observations: 3
+  Required distinct logical events before AI authoring can qualify.
+dev_risk_ai_max_generated: 8
+  Maximum number of newly generated top-level AI risk profiles for the run.
+dev_risk_ai_debug_card_enabled: false
+  Writes the dedicated AI Developable Risk generation debug card.
+dev_risk_ai_max_authoring_continues: 4
+  Maximum maintenance Continue retries after incomplete/invalid semantic authoring responses.
+dev_risk_ai_existing_coverage_min: 0.76
+  Coverage threshold used to suppress discovery already explained by an existing profile.
+
+AI PARENT-CANDIDATE ROUTING
+---------------------------
+dev_risk_ai_candidate_memory_turns: 14
+  Turns without meaningful support before an active parent hypothesis becomes dormant.
+dev_risk_ai_candidate_merge_min: 0.58
+  Minimum match for ordinary parent-candidate event merging.
+dev_risk_ai_candidate_margin: 0.1
+  Winner margin required when choosing among candidate parents.
+dev_risk_ai_dedupe_similarity: 0.86
+  Similarity threshold for treating event evidence as a duplicate.
+dev_risk_ai_duplicate_support: 0.06
+  Bounded support contribution allowed from duplicate/same-event corroboration.
+dev_risk_ai_max_candidates: 8
+  Maximum active parent hypotheses; capacity is score-prioritized.
+dev_risk_ai_unrouted_max: 24
+  Maximum retained risk-relevant events whose causal parent is unresolved.
+dev_risk_ai_unrouted_attach_min: 0.58
+  Minimum match to attach an unrouted event to an active parent.
+dev_risk_ai_unrouted_margin: 0.1
+  Winner margin for unrouted-event attachment.
+dev_risk_ai_candidate_replacement_margin: 0.12
+  Minimum advantage required for a new stronger parent to replace a weaker active parent at capacity.
+
+AI AUTHORING-READINESS SCORING
+------------------------------
+dev_risk_ai_causal_coherence_bonus_max: 0.35
+  Maximum readiness bonus for coherent receiver/source/mechanism evidence.
+dev_risk_ai_recurrence_bonus_max: 0.38
+  Maximum readiness bonus from repeated distinct events.
+dev_risk_ai_pattern_coherence_bonus_max: 0.2
+  Maximum readiness bonus when response channels form a coherent risk pattern.
+dev_risk_ai_ambiguity_penalty_max: 0.35
+  Maximum readiness penalty for unresolved/competing causal interpretations.
+dev_risk_ai_dormant_max: 16
+  Maximum compressed dormant parent seeds.
+dev_risk_ai_dormant_compaction_factor: 0.5
+  Fraction of current parent readiness retained when an inactive parent becomes one dormant historical event.
+
+AI RESPONSE/BLUEPRINT THRESHOLDS
+--------------------------------
+dev_risk_ai_response_owner_min: 0.55
+  Minimum affected-owner confidence for AI response-event discovery.
+dev_risk_ai_response_channel_min: 0.3
+  Minimum channel score retained as a response hypothesis.
+dev_risk_ai_blueprint_track_min: 0.52
+  Confidence floor used when evaluating track hypotheses in an authoring blueprint.
+dev_risk_ai_blueprint_track_margin: 0.1
+  Winner separation used when selecting track hypotheses.
+
+AI EXISTING-PROFILE PROGRESSION WATCH
+-------------------------------------
+dev_risk_ai_progression_watch_turns: 18
+  Evidence window for Progression Watch on an already acquired risk.
+dev_risk_ai_progression_track_match_min: 0.46
+  Minimum coverage for treating a new event as support/novel progression of an existing track.
+dev_risk_ai_progression_novel_effect_min: 0.38
+  Minimum novel-effect evidence for higher-SUCCESS consideration on an existing track.
+
+DEBUG / SERIALIZATION
+---------------------
+debug: true
+  Master switch for ordinary BTT debug collection.
+debug_keep_turns: 5
+  Turns of ordinary per-entity debug history retained for card display.
+debug_max_lines: 180
+  Maximum ordinary debug lines retained.
+anatomy_warning_chars: 900
+  Character count at which the Anatomy writer switches to compact identity formatting and warns about size.
+
+SAFE TUNING GUIDANCE
+--------------------
+- Prefer changing one subsystem at a time and retesting a fresh scenario.
+- Lowering evidence/commit thresholds increases false-positive risk.
+- AI authoring readiness is intentionally separate from Developable Risk acquisition
+  and track thresholds; do not assume they represent the same confidence scale.
+- Candidate memory is an inactivity horizon, not per-event decay. Dormant compaction
+  uses dev_risk_ai_dormant_compaction_factor once when a topic becomes inactive.
+- Creator-authored Developable Risk CHANCE/REPEAT/MAX/MEMORY values live on the risk
+  card itself; the dev_risk_default_* settings are compiler defaults for AI-generated
+  tracks when the script owns those mechanics.
