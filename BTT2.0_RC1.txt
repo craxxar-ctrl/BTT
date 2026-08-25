@@ -18,6 +18,18 @@
 
 var BTT_VERSION = "2.0.0-rc1";
 
+/* ---------------------------------------------------------------------------
+   RC1 RELEASE HOTFIX — SHARED OWNER/SLOT EVIDENCE
+   ---------------------------------------------------------------------------
+   Explicit possessive owner→slot evidence is extracted once per narrative
+   fragment during the shared parse build and stored in parse.shared. Later
+   Anatomy, Conditions, reproductive routing, delivery routing, and Developable
+   Risk consumers read that shared evidence instead of rescanning raw prose.
+
+   BTT_VERSION intentionally remains 2.0.0-rc1 so installing this performance
+   hotfix does not discard an existing adventure's canonical BTT state.
+--------------------------------------------------------------------------- */
+
 /* ============================================================================
    1. CANONICAL CONSTANTS AND CONFIGURATION
    ----------------------------------------------------------------------------
@@ -2337,7 +2349,7 @@ function BTT_resolveGenericObservationOwner(parse,f){
 }
 function BTT_resolveSlotObservationOwner(parse,f,slot){
   slot=BTT_lower(slot);var entities=BTT_sharedEntityList(parse),explicit=[],fallback=[];
-  for(var i=0;i<entities.length;i++){var e=entities[i],owned=BTT_ownedSlotEvidence(f,e,parse),best=null;for(var j=0;j<owned.length;j++)if(owned[j].slot===slot&&(!best||owned[j].confidence>best.confidence))best=owned[j];if(best)explicit.push({entity:e,score:Number(best.confidence)||0,slotConfidence:Number(best.confidence)||0,reason:best.reason||"explicit_owned_slot"});var g=BTT_fragmentEntityEvidenceScore(f,e);fallback.push({entity:e,score:g.score,slotConfidence:0,reason:(g.reasons||[]).join(",")||"entity_evidence"});}
+  for(var i=0;i<entities.length;i++){var e=entities[i],owned=BTT_sharedOwnedSlotEvidence(parse,f.index,e),best=null;for(var j=0;j<owned.length;j++)if(owned[j].slot===slot&&(!best||owned[j].confidence>best.confidence))best=owned[j];if(best)explicit.push({entity:e,score:Number(best.confidence)||0,slotConfidence:Number(best.confidence)||0,reason:best.reason||"explicit_owned_slot"});var g=BTT_fragmentEntityEvidenceScore(f,e);fallback.push({entity:e,score:g.score,slotConfidence:0,reason:(g.reasons||[]).join(",")||"entity_evidence"});}
   /* Once any character owns this slot explicitly, clause-level subject/focus is
      not allowed to create a competing owner for the same anatomical observation. */
   if(explicit.length)return BTT_pickResolvedObservation(explicit,0.82,0.08);
@@ -2370,7 +2382,7 @@ function BTT_bindAxisObservation(parse,f,axisEv){
      anatomical anchor when one exists (e.g. "Leandra's hips widen") before any
      fragment-level owner fallback is considered. This prevents a nearby observer
      from inheriting another character's axis change. */
-  for(var ai=0;ai<anchors.length;ai++){var slot=anchors[ai],base=Number(scores[slot])||0,owned=[];var entities=BTT_sharedEntityList(parse);for(var ei=0;ei<entities.length;ei++){var oe=BTT_ownedSlotEvidence(f,entities[ei],parse);for(var oi=0;oi<oe.length;oi++)if(oe[oi].slot===slot)owned.push({entity:entities[ei],slot:slot,score:Number(oe[oi].confidence)||0,base:base,reason:oe[oi].reason});}if(owned.length){owned.sort(function(a,b){return b.score-a.score;});var top=owned[0],next=owned[1]||{score:0};if(top.score>=0.82&&top.score-next.score>=0.08)rows.push({entity:top.entity,slot:slot,score:top.score+Math.min(0.10,base*0.20),confidence:top.score,margin:top.score-next.score,reason:top.reason});}else if(base>=0.08){var so=BTT_resolveSlotObservationOwner(parse,f,slot);if(so.entity)rows.push({entity:so.entity,slot:slot,score:Number(so.confidence)+Math.min(0.08,base*0.16),confidence:so.confidence,margin:so.margin,reason:so.reason});}}
+  for(var ai=0;ai<anchors.length;ai++){var slot=anchors[ai],base=Number(scores[slot])||0,owned=[];var entities=BTT_sharedEntityList(parse);for(var ei=0;ei<entities.length;ei++){var oe=BTT_sharedOwnedSlotEvidence(parse,f.index,entities[ei]);for(var oi=0;oi<oe.length;oi++)if(oe[oi].slot===slot)owned.push({entity:entities[ei],slot:slot,score:Number(oe[oi].confidence)||0,base:base,reason:oe[oi].reason});}if(owned.length){owned.sort(function(a,b){return b.score-a.score;});var top=owned[0],next=owned[1]||{score:0};if(top.score>=0.82&&top.score-next.score>=0.08)rows.push({entity:top.entity,slot:slot,score:top.score+Math.min(0.10,base*0.20),confidence:top.score,margin:top.score-next.score,reason:top.reason});}else if(base>=0.08){var so=BTT_resolveSlotObservationOwner(parse,f,slot);if(so.entity)rows.push({entity:so.entity,slot:slot,score:Number(so.confidence)+Math.min(0.08,base*0.16),confidence:so.confidence,margin:so.margin,reason:so.reason});}}
   rows.sort(function(a,b){return b.score-a.score;});var best=rows[0],runner=rows[1]||{score:0};if(best&&best.score-runner.score>=0.08){ev.boundOwner=best.entity;ev.boundSlot=best.slot;ev.ownerConfidence=BTT_round(best.confidence,3);ev.ownerMargin=BTT_round(best.margin,3);ev.slotConfidence=BTT_round(Number(scores[best.slot])||0,3);ev.bindingReason=best.reason||"owned_axis_anchor";return ev;}
   var own=BTT_resolveGenericObservationOwner(parse,f);if(!own.entity)return null;ev.boundOwner=own.entity;ev.boundSlot="";ev.ownerConfidence=BTT_round(own.confidence,3);ev.ownerMargin=BTT_round(own.margin,3);ev.slotConfidence=0;ev.bindingReason=own.reason||"owner_resolved";return ev;
 }
@@ -2578,7 +2590,12 @@ function BTT_sharedLexicalFrame(fragment){
   return {change:change,slotBase:slotBase,traits:traits,axes:axes,profileRefs:profileRefs,structure:BTT_sharedStructureEvidence(fragment.raw,slotBase,traits,change),provenance:{index:fragment.index,start:fragment.start,end:fragment.end,raw:BTT_clip(fragment.raw,240)}};
 }
 function BTT_buildSharedEvidence(parse){
-  parse.shared={entityCache:{},baselineBoundaries:parse.baselineBoundaries||{}};for(var i=0;i<parse.fragments.length;i++){var f=parse.fragments[i];f.shared=BTT_sharedLexicalFrame(f);f.shared.participantSubject=f.subject||"";f.shared.participantSubjectConfidence=Number(f.subjectConfidence)||0;}BTT_bindSharedObservations(parse);BTT_buildAtomicObservations(parse);return parse;
+  parse.shared={entityCache:{},ownedSlotEvidence:{},ownedSlotEntities:{},baselineBoundaries:parse.baselineBoundaries||{}};
+  for(var i=0;i<parse.fragments.length;i++){var f=parse.fragments[i];f.shared=BTT_sharedLexicalFrame(f);f.shared.participantSubject=f.subject||"";f.shared.participantSubjectConfidence=Number(f.subjectConfidence)||0;}
+  /* Owner→slot possessive syntax is raw lexical evidence, so it belongs here:
+     extract it exactly once before any owner/slot binding or domain consumer. */
+  BTT_buildOwnedSlotEvidenceCache(parse);
+  BTT_bindSharedObservations(parse);BTT_buildAtomicObservations(parse);return parse;
 }
 function BTT_sharedPhase(parse,entity,index){var b=parse&&parse.baselineBoundaries&&parse.baselineBoundaries.hasOwnProperty(entity)?Number(parse.baselineBoundaries[entity]):null;if(b!==null&&isFinite(b))return index<b?"BASELINE":"POST_BASELINE_CHANGE";return "CURRENT";}
 function BTT_sharedEntityFrame(parse,entity,index){
@@ -3180,26 +3197,66 @@ function BTT_conditionFamily(t){t=BTT_conditionType(t);if(["pregnancy","incubati
 function BTT_allMetaTraits(meta){var set={};for(var s in meta.slots)if(meta.slots.hasOwnProperty(s)){var a=meta.slots[s].traits||[];for(var i=0;i<a.length;i++)set[BTT_lower(a[i])]=1;}return set;}
 function BTT_hasAnyTrait(meta,traits){var set=BTT_allMetaTraits(meta);for(var i=0;i<traits.length;i++)if(set[BTT_lower(traits[i])])return true;return false;}
 function BTT_slotHas(meta,slot,trait){var s=meta&&meta.slots&&meta.slots[slot];return !!(s&&s.traits&&s.traits.indexOf(trait)>=0);}
-function BTT_entitySlotPrefixes(entity,f,parse){var xs=[],quoted=!!(f&&f.quoted);if(entity==="Player"){if(!quoted)xs.push("your","my");if(quoted&&f.speaker===entity)xs.push("my");if(quoted&&f.addressee===entity)xs.push("your");}else{var aliases=BTT_entityAliases(entity),sources=(parse&&parse.sources||[]).concat(parse&&parse.admitted||[]);for(var si=0;si<sources.length;si++)if(sources[si]&&sources[si].entity===entity)aliases=aliases.concat(sources[si].aliases||[],sources[si].name||[]);aliases=BTT_unique(aliases);for(var i=0;i<aliases.length;i++){var av=BTT_cleanSpace(aliases[i]);if(av&&!/^(?:he|she|they|him|her|them|his|their)$/i.test(av))xs.push(BTT_escapeRegExp(av).replace(/\ /g,"\s+")+"(?:['’]s)?");}if(quoted&&f.speaker===entity)xs.push("my");if(quoted&&f.addressee===entity)xs.push("your");if((f&&f.mentions||[]).some(function(m){return m.entity===entity&&m.alias==="pronoun"&&m.score>=0.50;}))xs.push("his","her","their");}return BTT_unique(xs);}
-function BTT_ownedSlotEvidence(f,entity,parse){
-  var raw=String(f&&f.raw||""),prefixes=BTT_entitySlotPrefixes(entity,f,parse),rows=[];
-  function add(slot,score,term,why,index){rows.push({slot:slot,confidence:score,term:term,reason:why,index:Number(index)||0});}
-  function ownedPattern(prefix,term){return new RegExp("\\b"+prefix+"(?:\\s+[A-Za-z][A-Za-z'-]*){0,3}\\s+"+term+"\\b","i");}
-  /* A possessive may contain short anatomical descriptors between owner and slot
-     ("Selene's feathered forearm", "your prehensile tail"). Those descriptors
-     must not prevent the slot from remaining attached to its actual owner. */
+/* ---------------------------------------------------------------------------
+   SHARED EXPLICIT OWNER→SLOT EXTRACTION
+   ---------------------------------------------------------------------------
+   This is lexical evidence used by the combined confidence engine. Expensive
+   raw-text work is performed once per fragment/entity during
+   BTT_buildSharedEvidence(). Downstream gameplay domains may only read
+   BTT_sharedOwnedSlotEvidence(); they must never rebuild possessor/slot regexes.
+--------------------------------------------------------------------------- */
+var BTT_OWNED_SLOT_LEXICON=null;
+function BTT_ownedSlotLexicon(){
+  if(BTT_OWNED_SLOT_LEXICON)return BTT_OWNED_SLOT_LEXICON;var termSlots={},surfaces=[];
   for(var slot in BTT_SLOT_TERMS)if(BTT_SLOT_TERMS.hasOwnProperty(slot)&&slot!=="misc"){
-    var terms=BTT_SLOT_TERMS[slot];for(var t=0;t<terms.length;t++){var term=BTT_escapeRegExp(terms[t]).replace(/\\ /g,"\\s+");for(var pr=0;pr<prefixes.length;pr++){var rx=ownedPattern(prefixes[pr],term),m=raw.match(rx);if(m)add(slot,0.99,terms[t],"explicit_owned_slot",m.index);}}
+    var terms=BTT_SLOT_TERMS[slot]||[];for(var i=0;i<terms.length;i++){var surface=BTT_lower(BTT_cleanSpace(terms[i]));if(!surface)continue;if(!termSlots[surface]){termSlots[surface]=[];surfaces.push(surface);}if(termSlots[surface].indexOf(slot)<0)termSlots[surface].push(slot);}
   }
-  for(var p2=0;p2<prefixes.length;p2++){
-    var tailRx=new RegExp("\\b"+prefixes[p2]+"(?:\\s+[A-Za-z][A-Za-z'-]*){0,2}\\s+tail\\s+(?:pussy|vagina|slit|opening)\\b","i"),tm=raw.match(tailRx);if(tm)add("tail",1.04,"tail pussy","compound_offslot_genital",tm.index);
-    var oralRx=new RegExp("\\b"+prefixes[p2]+"(?:\\s+[A-Za-z][A-Za-z'-]*){0,2}\\s+(?:mouth|throat)\\b","i"),om=raw.match(oralRx);if(om)add("head",1.01,"mouth/throat","owned_oral_slot",om.index);
+  /* Longest-first keeps multiword anatomy such as "shoulder blades" intact. */
+  surfaces.sort(function(a,b){return b.length-a.length;});var pattern=surfaces.map(function(x){return BTT_escapeRegExp(x).replace(/\ /g,"\\s+");}).join("|");
+  BTT_OWNED_SLOT_LEXICON={pattern:pattern,termSlots:termSlots};return BTT_OWNED_SLOT_LEXICON;
+}
+function BTT_entitySlotPrefixes(entity,f,parse){
+  var xs=[],quoted=!!(f&&f.quoted);
+  if(entity==="Player"){
+    if(!quoted)xs.push("your","my");if(quoted&&f.speaker===entity)xs.push("my");if(quoted&&f.addressee===entity)xs.push("your");
+  }else{
+    var aliases=BTT_entityAliases(entity),sources=(parse&&parse.sources||[]).concat(parse&&parse.admitted||[]);
+    for(var si=0;si<sources.length;si++)if(sources[si]&&sources[si].entity===entity)aliases=aliases.concat(sources[si].aliases||[],sources[si].name||[]);
+    aliases=BTT_unique(aliases);for(var i=0;i<aliases.length;i++){var av=BTT_cleanSpace(aliases[i]);if(av&&!/^(?:he|she|they|him|her|them|his|their)$/i.test(av))xs.push(BTT_escapeRegExp(av).replace(/\ /g,"\\s+")+"(?:['’]s)?");}
+    if(quoted&&f.speaker===entity)xs.push("my");if(quoted&&f.addressee===entity)xs.push("your");if((f&&f.mentions||[]).some(function(m){return m.entity===entity&&m.alias==="pronoun"&&m.score>=0.50;}))xs.push("his","her","their");
   }
+  return BTT_unique(xs).sort(function(a,b){return b.length-a.length;});
+}
+function BTT_extractOwnedSlotEvidence(f,entity,parse){
+  var raw=String(f&&f.raw||""),prefixes=BTT_entitySlotPrefixes(entity,f,parse),rows=[];if(!raw||!prefixes.length)return rows;
+  var lex=BTT_ownedSlotLexicon(),prefixPattern="(?:"+prefixes.join("|")+")",ownerRx=new RegExp("\\b"+prefixPattern+"((?:\\s+[A-Za-z][A-Za-z'-]*){1,5})","ig"),termRx=new RegExp("\\b("+lex.pattern+")\\b","ig"),m;
+  function add(slot,score,term,why,index){rows.push({slot:slot,confidence:score,term:term,reason:why,index:Number(index)||0});}
+  /* Capture each owned anatomical phrase once, then inspect its short local word
+     window. A slot term is eligible only when at most three descriptor words sit
+     between possessor and slot, preserving the former ownership grammar without
+     constructing a new regex for every prefix × slot × term combination. */
+  while((m=ownerRx.exec(raw))){var segment=String(m[1]||""),segmentStart=m.index+m[0].length-segment.length;termRx.lastIndex=0;var tm;
+    while((tm=termRx.exec(segment))){var before=BTT_cleanSpace(segment.slice(0,tm.index)),words=before?before.split(/\s+/).length:0;if(words<=3){var surface=BTT_lower(BTT_cleanSpace(tm[1])),slots=lex.termSlots[surface]||[];for(var si=0;si<slots.length;si++)add(slots[si],0.99,surface,"explicit_owned_slot",segmentStart+tm.index);}if(!tm[0].length)termRx.lastIndex++;}
+    if(!m[0].length)ownerRx.lastIndex++;
+  }
+  /* Preserve the higher-confidence compound semantics used by off-slot anatomy. */
+  var tailRx=new RegExp("\\b"+prefixPattern+"(?:\\s+[A-Za-z][A-Za-z'-]*){0,2}\\s+tail\\s+(?:pussy|vagina|slit|opening)\\b","i"),tailMatch=raw.match(tailRx);if(tailMatch)add("tail",1.04,"tail pussy","compound_offslot_genital",tailMatch.index);
+  var oralRx=new RegExp("\\b"+prefixPattern+"(?:\\s+[A-Za-z][A-Za-z'-]*){0,2}\\s+(?:mouth|throat)\\b","i"),oralMatch=raw.match(oralRx);if(oralMatch)add("head",1.01,"mouth/throat","owned_oral_slot",oralMatch.index);
   rows.sort(function(a,b){return b.confidence-a.confidence||a.index-b.index;});var ded=[];for(var i=0;i<rows.length;i++)if(!ded.some(function(x){return x.slot===rows[i].slot;}))ded.push(rows[i]);return ded;
 }
-function BTT_deliveryReachEvidence(f,entrySlot,receiver){
-  var raw=String(f&&f.raw||""),lower=BTT_lower(raw),finalSlot=entrySlot,score=0.55,reasons=[],prefixes=BTT_entitySlotPrefixes(receiver,f),ownedGut=false;
-  for(var i=0;i<prefixes.length;i++){var gp=new RegExp("\\b"+prefixes[i]+"(?:\\s+[A-Za-z][A-Za-z'-]*){0,2}\\s+(?:gut|stomach|abdomen|belly|intestines?|digestive\\s+tract)\\b","i");if(gp.test(raw)){ownedGut=true;break;}}
+function BTT_buildOwnedSlotEvidenceCache(parse){
+  if(!parse||!parse.fragments)return parse;parse.shared=parse.shared||{};parse.shared.ownedSlotEvidence={};parse.shared.ownedSlotEntities={};var entities=BTT_sharedEntityList(parse);
+  for(var fi=0;fi<parse.fragments.length;fi++){var f=parse.fragments[fi],present=[];for(var ei=0;ei<entities.length;ei++){var entity=entities[ei],rows=BTT_extractOwnedSlotEvidence(f,entity,parse),key=String(fi)+"|"+entity;parse.shared.ownedSlotEvidence[key]=rows;if(rows.length)present.push(entity);}parse.shared.ownedSlotEntities[String(fi)]=present;}
+  return parse;
+}
+function BTT_sharedOwnedSlotEvidence(parse,index,entity){
+  if(!parse||!parse.shared||!parse.shared.ownedSlotEvidence)return [];var key=String(Number(index)||0)+"|"+String(entity||"");return parse.shared.ownedSlotEvidence[key]||[];
+}
+function BTT_sharedOwnedSlotEntities(parse,index){
+  if(!parse||!parse.shared||!parse.shared.ownedSlotEntities)return [];return parse.shared.ownedSlotEntities[String(Number(index)||0)]||[];
+}
+function BTT_deliveryReachEvidence(f,entrySlot,receiver,parse){
+  var raw=String(f&&f.raw||""),lower=BTT_lower(raw),finalSlot=entrySlot,score=0.55,reasons=[],owned=BTT_sharedOwnedSlotEvidence(parse,f&&f.index,receiver),ownedGut=owned.some(function(x){return x.slot==="gut";});
   var directedGut=/\b(?:into|inside|within|down into|down to|reaches?|reach(?:es|ed|ing)?|fills?|floods?)\b[^.!?]{0,24}\b(?:the\s+)?(?:gut|stomach|abdomen|belly|intestines?|digestive tract)\b/i.test(raw);
   if(ownedGut||directedGut){finalSlot="gut";score=0.96;reasons.push("explicit_receiver_internal_destination");}
   else if(entrySlot==="head"&&/\b(?:swallow|swallows|swallowed|ingest|ingests|ingested|down (?:your|his|her|their) throat|into (?:your|his|her|their) throat|deep in (?:your|his|her|their) throat)\b/i.test(raw)){finalSlot="gut";score=0.86;reasons.push("oral_to_gut_ingestion");}
@@ -3207,18 +3264,22 @@ function BTT_deliveryReachEvidence(f,entrySlot,receiver){
   return {entrySlot:entrySlot,finalSlot:finalSlot,confidence:score,reasons:reasons};
 }
 function BTT_deliveryDestination(f,sourceEntity,parse,work){
-  var byReceiver={},transfer=/\b(?:into|inside|within|engulf|engulfs|engulfed|take|takes|took|receive|receives|received|flood|floods|flooded|fill|fills|filled|deposit|deposits|deposited|release|releases|released|ejaculat|swallow|ingest|penetrat|insert|enter)\b/i.test(String(f&&f.raw||""));
-  for(var entity in work)if(work.hasOwnProperty(entity)&&entity!==sourceEntity){var owned=BTT_ownedSlotEvidence(f,entity,parse),mention=BTT_fragmentMention(f,entity),best=null;for(var i=0;i<owned.length;i++){var r=owned[i],reach=BTT_deliveryReachEvidence(f,r.slot,entity),score=BTT_clamp(r.confidence+(transfer?0.10:0)+Math.max(0,mention-0.55)*0.08,0,1.08),row={receiver:entity,entrySlot:r.slot,finalSlot:reach.finalSlot,confidence:score,reachConfidence:reach.confidence,reasons:[r.reason].concat(reach.reasons)};if(!best||row.confidence>best.confidence)best=row;}if(best)byReceiver[entity]=best;}
+  var byReceiver={},transfer=/\b(?:into|inside|within|engulf|engulfs|engulfed|take|takes|took|receive|receives|received|flood|floods|flooded|fill|fills|filled|deposit|deposits|deposited|release|releases|released|ejaculat|swallow|ingest|penetrat|insert|enter)\b/i.test(String(f&&f.raw||"")),candidates=BTT_sharedOwnedSlotEntities(parse,f&&f.index);
+  for(var ci=0;ci<candidates.length;ci++){
+    var entity=candidates[ci];if(!work||!work.hasOwnProperty(entity)||entity===sourceEntity)continue;var owned=BTT_sharedOwnedSlotEvidence(parse,f.index,entity),mention=BTT_fragmentMention(f,entity),best=null;
+    for(var i=0;i<owned.length;i++){var r=owned[i],reach=BTT_deliveryReachEvidence(f,r.slot,entity,parse),score=BTT_clamp(r.confidence+(transfer?0.10:0)+Math.max(0,mention-0.55)*0.08,0,1.08),row={receiver:entity,entrySlot:r.slot,finalSlot:reach.finalSlot,confidence:score,reachConfidence:reach.confidence,reasons:[r.reason].concat(reach.reasons)};if(!best||row.confidence>best.confidence)best=row;}
+    if(best)byReceiver[entity]=best;
+  }
   var rows=[];for(var e in byReceiver)if(byReceiver.hasOwnProperty(e))rows.push(byReceiver[e]);rows.sort(function(a,b){return b.confidence-a.confidence;});var top=rows[0]||{receiver:"",entrySlot:"",finalSlot:"",confidence:0,reachConfidence:0,reasons:[]},next=rows[1]||{confidence:0};top.margin=BTT_round(top.confidence-next.confidence,3);return top;
 }
 function BTT_reproductiveSourceSlot(f,source,receiver,sourceMeta,parse){
-  if(!source||!source.entity||!sourceMeta)return {slot:"",confidence:0,reason:"source_slot_unresolved"};var owned=BTT_ownedSlotEvidence(f,source.entity,parse);if(owned.length)return {slot:owned[0].slot,confidence:owned[0].confidence,reason:owned[0].reason};var fr=BTT_sharedEntityFrame(parse,source.entity,f.index),best=BTT_sharedBestSlot(fr);if(best.slot&&best.score>=0.48&&sourceMeta.slots[best.slot])return {slot:best.slot,confidence:BTT_clamp(best.score,0,0.78),reason:"source_frame_slot"};return {slot:"",confidence:0,reason:"source_slot_unresolved"};
+  if(!source||!source.entity||!sourceMeta)return {slot:"",confidence:0,reason:"source_slot_unresolved"};var owned=BTT_sharedOwnedSlotEvidence(parse,f&&f.index,source.entity);if(owned.length)return {slot:owned[0].slot,confidence:owned[0].confidence,reason:owned[0].reason};var fr=BTT_sharedEntityFrame(parse,source.entity,f.index),best=BTT_sharedBestSlot(fr);if(best.slot&&best.score>=0.48&&sourceMeta.slots[best.slot])return {slot:best.slot,confidence:BTT_clamp(best.score,0,0.78),reason:"source_frame_slot"};return {slot:"",confidence:0,reason:"source_slot_unresolved"};
 }
 function BTT_slotHasAny(meta,slot,traits){for(var i=0;i<(traits||[]).length;i++)if(BTT_slotHas(meta,slot,BTT_normId(traits[i])))return true;return false;}
 function BTT_uniqueSlotWithTraits(meta,traits){var rows=[];for(var sl in (meta&&meta.slots||{}))if(meta.slots.hasOwnProperty(sl)){var ok=true;for(var i=0;i<(traits||[]).length;i++)if(!BTT_slotHas(meta,sl,BTT_normId(traits[i]))){ok=false;break;}if(ok)rows.push(sl);}return rows.length===1?{slot:rows[0],confidence:0.64,reason:"unique_source_trait_slot"}:{slot:"",confidence:0,reason:rows.length?"ambiguous_source_trait_slots":"no_source_trait_slot"};}
 function BTT_conditionSlotFromFragment(f,receiver,parse){var scores=parse?BTT_sharedEntityFrame(parse,receiver,f.index).slots:BTT_slotScores(f.raw,receiver,BTT_fragmentMention(f,receiver)),best="",bs=0;for(var s in scores.scores)if(scores.scores.hasOwnProperty(s)&&scores.scores[s]>bs){bs=scores.scores[s];best=s;}if(best&&bs>=0.24)return {slot:best,confidence:BTT_clamp(bs,0,1)};return {slot:"",confidence:0};}
 function BTT_reproductiveReceivingSlot(f,receiver,source,meta,parse){
-  var raw=String(f&&f.raw||""),rows=[],owned=BTT_ownedSlotEvidence(f,receiver,parse),frame=parse?BTT_sharedEntityFrame(parse,receiver,f.index):null;
+  var raw=String(f&&f.raw||""),rows=[],owned=BTT_sharedOwnedSlotEvidence(parse,f&&f.index,receiver),frame=parse?BTT_sharedEntityFrame(parse,receiver,f.index):null;
   function add(slot,score,why){if(meta&&meta.slots&&meta.slots[slot])rows.push({slot:slot,confidence:score,reason:why});}
   for(var i=0;i<owned.length;i++){var os=owned[i];if(BTT_slotHas(meta,os.slot,"vaginal")||BTT_slotHas(meta,os.slot,"receptive")||os.slot==="vagina")add(os.slot,Math.max(0.90,os.confidence),os.reason+":eligible_reproductive_slot");}
   if(frame){for(var sl in meta.slots)if(meta.slots.hasOwnProperty(sl)&&(BTT_slotHas(meta,sl,"vaginal")||BTT_slotHas(meta,sl,"receptive")||sl==="vagina")){var sc=Number(frame.slots.scores[sl]||0);if(sc>=0.28)add(sl,BTT_clamp(0.62+sc*0.32,0,0.92),"shared_frame_reproductive_slot");}}
@@ -3266,7 +3327,7 @@ function BTT_reproductiveReceiverCandidates(f,parse,work){
     if(f.subject===entity&&f.subjectConfidence>=0.75&&transitiveObjectPronoun()&&!/\b(?:yourself|himself|herself|themselves)\b/i.test(raw)&&!new RegExp("\\b(?:you|"+aliases.map(BTT_escapeRegExp).join("|")+")\\s+(?:are|were|get|got)\\s+(?:inseminated|impregnated|fertilized)","i").test(raw)){
       score=Math.min(score,0.18);reasons.push("source_subject_exclusion");
     }
-    var sl=BTT_reproductiveReceivingSlot(f,entity,null,meta,parse);if(sl.slot&&BTT_receivingSlotEligible(meta,sl.slot,"ordinary",sl.confidence)){var actualTransfer=/\b(?:inseminat(?:e|es|ed|ing|ion)|impregnat(?:e|es|ed|ing|ion)|fertiliz(?:e|es|ed|ing|ation)|ejaculat(?:e|es|ed|ing|ion)|breed(?:s|ing|ed)?|bred|deposit(?:s|ed|ing)?|releas(?:e|es|ed|ing)|fill(?:s|ed|ing)?|flood(?:s|ed|ing)?|finish(?:es|ed|ing)?|climax(?:es|ed|ing)?|semen|cum)\b/i.test(raw);if(actualTransfer&&BTT_ownedSlotEvidence(f,entity,parse).some(function(x){return x.slot===sl.slot;})){score=Math.max(score,0.96);reasons.push("explicit_owned_receiving_slot:"+sl.slot);}else{score=Math.min(1,score+0.06);reasons.push("eligible_receiving_slot:"+sl.slot);}}
+    var sl=BTT_reproductiveReceivingSlot(f,entity,null,meta,parse);if(sl.slot&&BTT_receivingSlotEligible(meta,sl.slot,"ordinary",sl.confidence)){var actualTransfer=/\b(?:inseminat(?:e|es|ed|ing|ion)|impregnat(?:e|es|ed|ing|ion)|fertiliz(?:e|es|ed|ing|ation)|ejaculat(?:e|es|ed|ing|ion)|breed(?:s|ing|ed)?|bred|deposit(?:s|ed|ing)?|releas(?:e|es|ed|ing)|fill(?:s|ed|ing)?|flood(?:s|ed|ing)?|finish(?:es|ed|ing)?|climax(?:es|ed|ing)?|semen|cum)\b/i.test(raw);if(actualTransfer&&BTT_sharedOwnedSlotEvidence(parse,f&&f.index,entity).some(function(x){return x.slot===sl.slot;})){score=Math.max(score,0.96);reasons.push("explicit_owned_receiving_slot:"+sl.slot);}else{score=Math.min(1,score+0.06);reasons.push("eligible_receiving_slot:"+sl.slot);}}
     rows.push({entity:entity,confidence:BTT_clamp(score,0,1),reasons:reasons});
   }
   rows.sort(function(a,b){return b.confidence-a.confidence;});var top=rows[0]||{entity:"",confidence:0,reasons:[]},next=rows[1]||{confidence:0};top.margin=BTT_round(top.confidence-next.confidence,3);top.ranking=rows;return top;
@@ -3833,7 +3894,10 @@ function BTT_processNarrative(raw,phase){
   BTT_preflightImportAll();BTT_sanitizeProfileCardTriggers();BTT_prunePhysicalGraph();
   var visible=String(raw||"");if(phase==="output")visible=BTT_captureAppearanceRefresh(visible,"Player");
   BTT_advanceWorldDay(visible);if(phase==="output")BTT_ensureState().turnCounter=(Number(BTT_ensureState().turnCounter)||0)+1;
-  var parse=BTT_parseNarrative(visible,phase);BTT_ensureState().currentTransaction={phase:phase,parse:parse,startedTurn:BTT_getTurn(),action:BTT_nowAction()};
+  var parse=BTT_parseNarrative(visible,phase);
+  /* parse.shared now contains the complete explicit owner→slot lexical cache.
+     No downstream gameplay domain is permitted to rebuild that evidence. */
+  BTT_ensureState().currentTransaction={phase:phase,parse:parse,startedTurn:BTT_getTurn(),action:BTT_nowAction()};
   var work=BTT_materializeEntities(parse);
   /* NPC genesis is resolved before causal mutation so a first transformation
      snapshots the best available pre-change identity/body rather than a neutral
